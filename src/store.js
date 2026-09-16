@@ -1,19 +1,24 @@
 // JSON 文件持久化存储。
 //
 // 并发与一致性保证：
-//  1) 单写者队列：所有变更串行化，读快照也在同一队列内，避免读到半截状态；
-//  2) 乐观版本号（CAS）：每次变更必须携带 expectedVersion，版本不符抛 ConflictError，
-//     「并发只生成一个不可覆盖版本」——后到的写被拒绝，而不是覆盖先到的版本；
-//  3) 原子落盘：写 *.tmp + fsync + rename，进程崩溃不会出现半截 JSON；
+//  1) 单写者队列（进程内）+ FileLock（跨实例/跨进程）：迁移与每次提交写都串行化；
+//  2) 乐观版本号（CAS）：每次变更必须携带 expectedVersion，提交前在锁内读取磁盘最新版本，
+//     版本不符抛 ConflictError——后到的写明确失败，绝不覆盖先到实例的结果；
+//  3) 原子落盘：每实例唯一名 *.tmp + fsync + rename，进程崩溃不会出现半截 JSON；
+//     锁内清理上次崩溃残留 tmp，绝不删其他实例正在写的文件；
 //  4) 整体回滚：变更回调中抛错（含磁盘写失败）时，内存状态不替换、文件不动；
-//  5) 重启恢复：下次启动从同一文件读出，版本号继续递增。
+//  5) 重启恢复：从同一文件读出，版本号继续；读时按版本号跨实例刷新缓存。
 
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { existsSync } from "node:fs";
 import * as fssync from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { ConflictError, NotFoundError, migrateLevels } from "./domain.js";
+import { FileLock, LockTimeoutError } from "./file-lock.js";
+
+export { LockTimeoutError } from "./file-lock.js";
 
 const FILE_VERSION = 2;
 
@@ -29,16 +34,19 @@ const fsync = (fd) => new Promise((resolve, reject) => {
 export class JsonStore {
   // filePath      新运行时可写库 data/runtime.json
   // legacyPath    旧版数据文件 data/model-rigging-calibration.json（仅在运行时库缺失时迁移）
-  constructor(filePath, seedFactory, { legacyPath = null } = {}) {
+  constructor(filePath, seedFactory, { legacyPath = null, lockWaitMs = 5000, staleMs = 15000 } = {}) {
     this.filePath = filePath;
     this.legacyPath = legacyPath;
     this.seedFactory = seedFactory; // () => ({ rigs, items })
     this.chain = Promise.resolve();
     this.state = null; // { fileVersion, rigs, items, version, updatedAt }
+    this.instanceId = randomUUID().slice(0, 8);
+    this.lock = new FileLock(filePath, { waitMs: lockWaitMs, staleMs });
   }
 
-  // 清理同目录内本库上次崩溃残留的 *.tmp-<pid>（按文件名前缀匹配，不动别的库）
-  async _cleanStaleTmp() {
+  // 持锁期间清理本库崩溃残留 tmp：此刻不可能有别的实例在写本库（写必须持锁），
+  // 因此匹配前缀的 tmp 必然是陈旧的。
+  async _cleanStaleTmpLocked() {
     const dir = dirname(this.filePath);
     const base = basename(this.filePath);
     let names = [];
@@ -51,7 +59,7 @@ export class JsonStore {
   }
 
   async _atomicWrite(state) {
-    const tmp = `${this.filePath}.tmp-${process.pid}`;
+    const tmp = `${this.filePath}.tmp-${process.pid}-${this.instanceId}`;
     try {
       const fh = await fs.open(tmp, "w");
       try {
@@ -71,30 +79,53 @@ export class JsonStore {
     }
   }
 
+  // 从磁盘读取最新状态（必须持锁时调用）
+  async _readDiskState() {
+    const raw = await fs.readFile(this.filePath, "utf8");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      throw new Error(`运行时数据文件损坏，拒绝写入: ${e.message}`);
+    }
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.rigs)) {
+      throw new Error("运行时数据文件结构非法，拒绝写入");
+    }
+    if (!Array.isArray(parsed.items)) parsed.items = [];
+    if (typeof parsed.version !== "number") parsed.version = 1;
+    return parsed;
+  }
+
   async _ensureLoaded() {
     if (this.state) return;
-    await fs.mkdir(dirname(this.filePath), { recursive: true });
-    await this._cleanStaleTmp();
+    if (this._loading) return this._loading;
+    this._loading = this.lock.withLock(async () => {
+      if (this.state) return; // 进程内并发只做一次
+      await fs.mkdir(dirname(this.filePath), { recursive: true });
+      await this._cleanStaleTmpLocked();
 
-    // 数据源选择，固定顺序：
-    //   1) 新运行时文件存在 -> 直接使用（即使旧文件也在，绝不重复导入）
-    //   2) 仅有旧文件       -> 安全迁移到运行时文件（原子写，失败两文件都保持可读）
-    //   3) 两处都没有       -> 从交付快照播种
-    if (existsSync(this.filePath)) {
-      this.state = await this._loadRuntime();
-      return;
-    }
-    if (this.legacyPath && existsSync(this.legacyPath)) {
-      this.state = await this._migrateLegacy();
-      return;
-    }
-    this.state = {
-      fileVersion: FILE_VERSION,
-      version: 1,
-      updatedAt: new Date().toISOString(),
-      ...this.seedFactory(),
-    };
-    await this._atomicWrite(this.state);
+      // 持锁后重新复查（另一实例可能刚完成迁移/播种）：
+      //   1) 新运行时文件存在 -> 直接读取复用，绝不重复导入；
+      //   2) 仅有旧文件       -> 安全迁移到运行时文件；
+      //   3) 两处都没有       -> 从交付快照播种。
+      if (existsSync(this.filePath)) {
+        this.state = await this._loadRuntime();
+        return;
+      }
+      if (this.legacyPath && existsSync(this.legacyPath)) {
+        this.state = await this._migrateLegacy();
+        return;
+      }
+      const seeded = {
+        fileVersion: FILE_VERSION,
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        ...this.seedFactory(),
+      };
+      await this._atomicWrite(seeded);
+      this.state = seeded;
+    }).finally(() => { this._loading = null; });
+    return this._loading;
   }
 
   async _loadRuntime() {
@@ -168,33 +199,56 @@ export class JsonStore {
     return state;
   }
 
-  // 把一个变更排入单写者队列。mutator 在可变草稿上操作，返回结果；
-  // 抛错则草稿丢弃（回滚），成功才原子落盘并替换快照。
+  // 把一个变更排入单写者队列。
+  // mutator(base, ctx) 收到的是“磁盘最新”状态的可变草稿：进入跨实例锁后先重读，
+  // 若版本已被另一实例推进，直接抛 CONCURRENT_VERSION_CONFLICT（过期写入明确失败）；
+  // mutator 自身的 expectedVersion 检查、随后的原子落盘全部在锁内完成。
+  // mutator 返回 { result, baseVersion }；提交版本 = baseVersion + 1。
   _enqueue(mutator) {
     const run = this.chain.then(async () => {
       await this._ensureLoaded();
-      const draft = structuredClone(this.state);
-      const result = await mutator(draft);
-      draft.version = bump(draft.version);
-      draft.updatedAt = new Date().toISOString();
-      try {
-        await this._atomicWrite(draft);
-      } catch (e) {
-        // 写入失败：保留旧快照，整体回滚
-        throw new Error(`持久化写入失败，已回滚: ${e.message}`);
-      }
-      this.state = draft;
-      return result;
+      return this.lock.withLock(async () => {
+        // 持锁后读最新磁盘状态（其他实例可能已提交）
+        const fresh = await this._readDiskState();
+        let result;
+        try {
+          result = await mutator(fresh);
+        } catch (e) {
+          // 业务/版本错误：草稿丢弃，不写盘；刷新内存缓存到最新磁盘状态
+          this.state = await this._readDiskStateSafe();
+          throw e;
+        }
+        fresh.version = bump(fresh.version);
+        fresh.updatedAt = new Date().toISOString();
+        try {
+          await this._atomicWrite(fresh);
+        } catch (e) {
+          throw new Error(`持久化写入失败，已回滚: ${e.message}`);
+        }
+        this.state = structuredClone(fresh);
+        return result;
+      });
     });
     // 不让队列因一次失败而永久 reject
     this.chain = run.then(() => {}, () => {});
     return run;
   }
 
-  // 只读快照（排队执行以与写入互斥）
+  async _readDiskStateSafe() {
+    try { return await this._readDiskState(); } catch { return this.state; }
+  }
+
+  // 只读：优先返回跨实例最新版本（无锁，利用原子 rename 不会读到半截 JSON）；
+  // 读不到时回退本实例已加载缓存。
   async read() {
     const run = this.chain.then(async () => {
       await this._ensureLoaded();
+      if (existsSync(this.filePath)) {
+        try {
+          const disk = await this._loadRuntime();
+          if (!this.state || disk.version >= this.state.version) this.state = disk;
+        } catch { /* 磁盘暂时不可读时用缓存 */ }
+      }
       return structuredClone(this.state);
     });
     this.chain = run.then(() => {}, () => {});

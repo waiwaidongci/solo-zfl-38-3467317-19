@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -428,4 +428,76 @@ test("浏览器升级迁移：仅旧文件时迁移，台账与帆装并存，�
 
   assert.equal(errors.length, 0, "页面 JS 错误：" + errors.join(" | "));
   await page.close();
+});
+
+test("浏览器双实例共享库：同时迁移不重复、同版本并发写一方冲突后可恢复", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sail-xi-"));
+  const runtime = path.join(dir, "runtime.json");
+  const legacy = path.join(dir, "model-rigging-calibration.json");
+  await writeFile(legacy, JSON.stringify({ items: legacySnapshot().items }), "utf8");
+
+  const startShared = async () => {
+    const store = new JsonStore(runtime, seedData, { legacyPath: legacy, lockWaitMs: 4000 });
+    const server = http.createServer(createApp(store));
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    return { base: `http://127.0.0.1:${server.address().port}`, stop: () => new Promise((resolve) => server.close(() => resolve())) };
+  };
+
+  // 两个实例同时首启（runtime.json 尚不存在）
+  const [s1, s2] = await Promise.all([startShared(), startShared()]);
+  t.after(async () => { await s1.stop().catch(() => {}); await s2.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+
+  // 两侧页面同时加载，竞争首次迁移
+  const page1 = await browser.newPage();
+  const page2 = await browser.newPage();
+  t.after(() => Promise.all([page1.close(), page2.close()]));
+  await Promise.all([
+    page1.goto(s1.base).then(() => page1.waitForSelector(".rigline")),
+    page2.goto(s2.base).then(() => page2.waitForSelector(".rigline")),
+  ]);
+
+  // 两侧都看到帆装与旧台账，且迁移只发生一次
+  for (const p of [page1, page2]) {
+    await p.click("summary");
+    await p.waitForSelector("#mList");
+    assert.match(await p.textContent("#mList"), /前桅侧支索[\s\S]*?后桅升帆索/);
+  }
+  const onDisk = JSON.parse(await readFile(runtime, "utf8"));
+  assert.equal(onDisk.items.length, 1);
+  assert.equal(onDisk.migration.itemsImported, 1);
+
+  // 两实例都停在 v1：测试侧（Node）对两个端口并发提交同版本作业，避免页面跨端口 CORS
+  const postReef = (base, sailId) => fetch(base + "/api/rigs/FC-001/reef", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ moves: [{ sailId, toLevel: 1 }], expectedVersion: 1 }),
+  }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  const results = await Promise.all([postReef(s1.base, "main"), postReef(s2.base, "fore")]);
+  const codes = results.map((r) => r.status).sort();
+  assert.deepEqual(codes, [200, 409]);
+  const conflict = results.find((r) => r.status === 409);
+  assert.match(conflict.body.error, /VERSION_CONFLICT/);
+
+  // 失败侧刷新后看到先写结果（main=1, fore=0），带 v2 重试成功
+  await page2.click("#reload");
+  await page2.waitForTimeout(150);
+  await page2.click('.rigline[data-code="FC-001"]');
+  await page2.waitForFunction(() => /主桅帆[\s\S]*?1 \/ 3/.test(document.querySelector("#reefControls").textContent));
+  const retry = await page2.evaluate(async (base) => {
+    const r = await fetch(base + "/api/rigs/FC-001/reef", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ moves: [{ sailId: "fore", toLevel: 1 }], expectedVersion: 2 }),
+    });
+    return { status: r.status };
+  }, s2.base);
+  assert.equal(retry.status, 200);
+  const finalDisk = JSON.parse(await readFile(runtime, "utf8"));
+  const rig = finalDisk.rigs.find((r) => r.code === "FC-001");
+  assert.equal(rig.version, 3);
+  assert.deepEqual(rig.currentLevels, { fore: 1, main: 1, mizzen: 0 });
+
+  // 锁文件释放、无临时残留
+  const leftovers = (await readdir(dir)).filter((n) => n.endsWith(".lock") || n.includes(".tmp-"));
+  assert.deepEqual(leftovers, []);
+  await page1.evaluate(() => window.scrollTo(0, 0));
+  await page1.screenshot({ path: path.join(shotDir, "15-cross-instance.png") });
 });
