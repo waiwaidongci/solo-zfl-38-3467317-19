@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,7 +16,7 @@ import http from "node:http";
 import { chromium } from "playwright";
 import { JsonStore } from "../src/store.js";
 import { createApp } from "../src/app.js";
-import { seedData } from "../src/seed.js";
+import { seedData, legacySnapshot } from "../src/seed.js";
 
 // 本地解包的 Chromium 运行库（无 root 环境）
 const EXTRA_LIB = [
@@ -360,6 +360,71 @@ test("浏览器旧台账：两条任务与模型日志可见，可追加且旧�
   await page.click('.rigline[data-code="FC-001"]');
   await page.waitForSelector(".banner");
   assert.ok(await page.locator("#envelope svg").count() === 1);
+
+  assert.equal(errors.length, 0, "页面 JS 错误：" + errors.join(" | "));
+  await page.close();
+});
+
+test("浏览器升级迁移：仅旧文件时迁移，台账与帆装并存，重启沿用结果", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sail-migrate-"));
+  const runtime = path.join(dir, "runtime.json");
+  const legacy = path.join(dir, "model-rigging-calibration.json");
+  // 只放旧版 v1 台账文件，不建运行时文件
+  await writeFile(legacy, JSON.stringify({ items: legacySnapshot().items }), "utf8");
+  const startMig = async () => {
+    const store = new JsonStore(runtime, seedData, { legacyPath: legacy });
+    const server = http.createServer(createApp(store));
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    return { base: `http://127.0.0.1:${server.address().port}`, stop: () => new Promise((resolve) => server.close(() => resolve())) };
+  };
+
+  const srv = await startMig();
+  t.after(async () => { await srv.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+
+  const page = await browser.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.goto(srv.base);
+
+  // 帆装已补齐且可用
+  await page.waitForSelector(".rigline");
+  await page.click('.rigline[data-code="FC-001"]');
+  await page.waitForSelector(".banner");
+  assert.ok(await page.locator("#envelope svg").count() === 1);
+
+  // 旧台账两条任务与模型日志都在
+  await page.click("summary");
+  await page.waitForSelector("#mList");
+  const text = await page.textContent("#mList");
+  assert.match(text, /T-1[\s\S]*?前桅侧支索[\s\S]*?已缩短2mm/);
+  assert.match(text, /T-1782013829186[\s\S]*?后桅升帆索[\s\S]*?回退半圈/);
+  assert.match(text, /模型日志（1 条）/);
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.screenshot({ path: path.join(shotDir, "14-upgrade-migration.png"), fullPage: true });
+
+  // 迁移后写入：收一档帆 + 追加台账日志
+  await page.click('.lvlbtn[data-op="in"][data-sail="main"]');
+  await page.waitForFunction(() => /v2/.test(document.querySelector("#storeVer").textContent));
+  await page.fill('.m-log-note[data-id="MR-001"]', "迁移后浏览器追加");
+  await page.click('.m-log-btn[data-id="MR-001"]');
+  await page.waitForFunction(() => /迁移后浏览器追加/.test(document.querySelector("#mList").textContent));
+
+  // 重启：沿用迁移结果（v2、主帆 1 档、新日志），不重复导入
+  await srv.stop();
+  const srv2 = await startMig();
+  t.after(() => srv2.stop().catch(() => {}));
+  await page.goto(srv2.base);
+  await page.click('.rigline[data-code="FC-001"]');
+  await page.waitForFunction(() => /v2/.test(document.querySelector("#storeVer").textContent));
+  const level = await page.textContent('#reefControls .sailrow:has([data-sail="main"]) .lvl');
+  assert.match(level, /1 \/ 3/);
+  await page.click("summary");
+  await page.waitForSelector("#mList");
+  const text2 = await page.textContent("#mList");
+  assert.match(text2, /前桅侧支索/);
+  assert.match(text2, /后桅升帆索/);
+  assert.match(text2, /迁移后浏览器追加/);
+  assert.match(text2, /模型日志（2 条）/);
 
   assert.equal(errors.length, 0, "页面 JS 错误：" + errors.join(" | "));
   await page.close();

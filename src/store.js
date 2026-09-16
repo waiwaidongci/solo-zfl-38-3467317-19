@@ -11,7 +11,7 @@
 import { promises as fs } from "node:fs";
 import { existsSync } from "node:fs";
 import * as fssync from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { ConflictError, NotFoundError, migrateLevels } from "./domain.js";
 
@@ -27,62 +27,145 @@ const fsync = (fd) => new Promise((resolve, reject) => {
 });
 
 export class JsonStore {
-  constructor(filePath, seedFactory) {
+  // filePath      新运行时可写库 data/runtime.json
+  // legacyPath    旧版数据文件 data/model-rigging-calibration.json（仅在运行时库缺失时迁移）
+  constructor(filePath, seedFactory, { legacyPath = null } = {}) {
     this.filePath = filePath;
+    this.legacyPath = legacyPath;
     this.seedFactory = seedFactory; // () => ({ rigs, items })
     this.chain = Promise.resolve();
     this.state = null; // { fileVersion, rigs, items, version, updatedAt }
   }
 
+  // 清理同目录内本库上次崩溃残留的 *.tmp-<pid>（按文件名前缀匹配，不动别的库）
+  async _cleanStaleTmp() {
+    const dir = dirname(this.filePath);
+    const base = basename(this.filePath);
+    let names = [];
+    try {
+      names = await fs.readdir(dir);
+    } catch { return; }
+    await Promise.all(names
+      .filter((n) => n.startsWith(base + ".tmp-"))
+      .map((n) => fs.unlink(join(dir, n)).catch(() => {})));
+  }
+
   async _atomicWrite(state) {
     const tmp = `${this.filePath}.tmp-${process.pid}`;
-    const fh = await fs.open(tmp, "w");
     try {
-      await fh.writeFile(JSON.stringify(state, null, 2), "utf8");
-      await fsync(fh.fd);
-    } finally {
-      await fh.close().catch(() => {});
+      const fh = await fs.open(tmp, "w");
+      try {
+        await fh.writeFile(JSON.stringify(state, null, 2), "utf8");
+        await fsync(fh.fd);
+      } finally {
+        await fh.close().catch(() => {});
+      }
+      await fs.rename(tmp, this.filePath);
+      // fsync 目录，保证 rename 落盘（重启/掉电安全）；个别文件系统不支持则忽略
+      const dir = await fs.open(dirname(this.filePath));
+      try { await fsync(dir.fd); } catch { /* 目录 fsync 不被支持时可忽略 */ } finally { await dir.close(); }
+    } catch (e) {
+      // 任何阶段失败都清掉半套临时文件，绝不留下半截副本
+      await fs.unlink(tmp).catch(() => {});
+      throw e;
     }
-    await fs.rename(tmp, this.filePath);
-    // fsync 目录，保证 rename 落盘（重启/掉电安全）；个别文件系统不支持则忽略
-    const dir = await fs.open(dirname(this.filePath));
-    try { await fsync(dir.fd); } catch { /* 目录 fsync 不被支持时可忽略 */ } finally { await dir.close(); }
   }
 
   async _ensureLoaded() {
     if (this.state) return;
-    if (!existsSync(this.filePath)) {
-      await fs.mkdir(dirname(this.filePath), { recursive: true });
-      this.state = {
-        fileVersion: FILE_VERSION,
-        version: 1,
-        updatedAt: new Date().toISOString(),
-        ...this.seedFactory(),
-      };
-      await this._atomicWrite(this.state);
+    await fs.mkdir(dirname(this.filePath), { recursive: true });
+    await this._cleanStaleTmp();
+
+    // 数据源选择，固定顺序：
+    //   1) 新运行时文件存在 -> 直接使用（即使旧文件也在，绝不重复导入）
+    //   2) 仅有旧文件       -> 安全迁移到运行时文件（原子写，失败两文件都保持可读）
+    //   3) 两处都没有       -> 从交付快照播种
+    if (existsSync(this.filePath)) {
+      this.state = await this._loadRuntime();
       return;
     }
+    if (this.legacyPath && existsSync(this.legacyPath)) {
+      this.state = await this._migrateLegacy();
+      return;
+    }
+    this.state = {
+      fileVersion: FILE_VERSION,
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      ...this.seedFactory(),
+    };
+    await this._atomicWrite(this.state);
+  }
+
+  async _loadRuntime() {
     const raw = await fs.readFile(this.filePath, "utf8");
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      throw new Error(`持久化文件损坏，拒绝启动: ${e.message}`);
+      throw new Error(`运行时数据文件损坏，拒绝启动: ${e.message}`);
     }
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("持久化文件不是有效对象，拒绝启动");
-    }
-    // v1（帆索校准）-> v2（增加帆装配平）：保留既有 items，补 rigs 并落盘一次
-    let migrated = false;
-    if (!Array.isArray(parsed.rigs)) {
-      parsed.rigs = this.seedFactory().rigs;
-      parsed.fileVersion = FILE_VERSION;
-      migrated = true;
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.rigs)) {
+      throw new Error("运行时数据文件结构非法，拒绝启动");
     }
     if (!Array.isArray(parsed.items)) parsed.items = [];
-    if (typeof parsed.version !== "number") { parsed.version = 1; migrated = true; }
-    this.state = parsed;
-    if (migrated) await this._atomicWrite(this.state);
+    if (typeof parsed.version !== "number") parsed.version = 1;
+    return parsed;
+  }
+
+  // 读取并迁移旧版文件。旧文件只读，永不修改；结果原子写入新运行时文件。
+  // 任何一步失败都抛错：此时运行时文件尚未 rename 出来，旧文件保持原样，可重试。
+  async _migrateLegacy() {
+    const raw = await fs.readFile(this.legacyPath, "utf8");
+    let legacy;
+    try {
+      legacy = JSON.parse(raw);
+    } catch (e) {
+      throw new Error(`旧数据文件损坏，无法迁移（原文件未改动，请修复后重试）: ${e.message}`);
+    }
+    if (!legacy || typeof legacy !== "object") {
+      throw new Error("旧数据文件不是有效对象，无法迁移（原文件未改动）");
+    }
+    if (legacy.items !== undefined && !Array.isArray(legacy.items)) {
+      throw new Error("旧数据文件的 items 不是数组，无法迁移（原文件未改动）");
+    }
+    if (legacy.rigs !== undefined && !Array.isArray(legacy.rigs)) {
+      throw new Error("旧数据文件的 rigs 不是数组，无法迁移（原文件未改动）");
+    }
+
+    // 保留旧台账：编号、任务、日志逐字保留；缺 id 的旧记录用 code 兜底
+    const items = (legacy.items || []).map((it) => ({
+      ...it,
+      id: it.id || it.code,
+      tasks: Array.isArray(it.tasks) ? it.tasks : [],
+      logs: Array.isArray(it.logs) ? it.logs : [],
+    }));
+
+    // 若旧文件已含帆装（曾经迁移过的库），连同档位与版本一并保留；
+    // 纯 v1 台账库（无 rigs）才补齐种子帆装。
+    let rigs;
+    if (Array.isArray(legacy.rigs)) {
+      rigs = legacy.rigs;
+    } else {
+      rigs = this.seedFactory().rigs;
+    }
+
+    const state = {
+      fileVersion: FILE_VERSION,
+      version: typeof legacy.version === "number" ? legacy.version : 1,
+      updatedAt: new Date().toISOString(),
+      rigs,
+      items,
+      migration: {
+        from: this.legacyPath,
+        at: new Date().toISOString(),
+        itemsImported: items.length,
+        rigsImported: Array.isArray(legacy.rigs) ? legacy.rigs.length : 0,
+      },
+    };
+    // 原子落盘：rename 成功才算迁移成功；失败则不留运行时文件
+    await this._atomicWrite(state);
+    return state;
   }
 
   // 把一个变更排入单写者队列。mutator 在可变草稿上操作，返回结果；

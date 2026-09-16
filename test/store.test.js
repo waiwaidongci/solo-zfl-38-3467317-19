@@ -118,11 +118,20 @@ test("重启持久化：新 store 指向同一文件，档位与版本延续", a
   assert.equal(r.version, 4);
 });
 
-test("v1 旧数据文件自动迁移：items 保留、rigs 补齐、版本落盘", async () => {
-  const { file, dir } = await tempDbFile("migrate");
+test("运行时文件缺少 rigs（非法结构）拒绝启动而不是悄悄重建", async () => {
+  const { file, dir } = await tempDbFile("bad-runtime");
   after(() => cleanup(dir));
-  await writeFile(file, JSON.stringify({ items: [{ id: "OLD-1", code: "MR-OLD", status: "待检查" }] }), "utf8");
+  await writeFile(file, JSON.stringify({ items: [{ id: "OLD-1", code: "MR-OLD" }] }), "utf8");
   const store = new JsonStore(file, seedData);
+  await assert.rejects(() => store.listItems(), /运行时数据文件/);
+});
+
+test("旧版数据文件经 legacyPath 安全迁移：items 保留、rigs 补齐", async () => {
+  const { file, dir } = await tempDbFile("from-legacy");
+  after(() => cleanup(dir));
+  const legacy = file.replace(/db\.json$/, "model-rigging-calibration.json");
+  await writeFile(legacy, JSON.stringify({ items: [{ id: "OLD-1", code: "MR-OLD", status: "待检查", tasks: [], logs: [] }] }), "utf8");
+  const store = new JsonStore(file, seedData, { legacyPath: legacy });
   const items = await store.listItems();
   assert.equal(items[0].code, "MR-OLD");
   const rigs = await store.listRigs();
