@@ -1,9 +1,15 @@
 {
   "name": "zfl-38-model-rigging-calibration",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/domain.test.js test/physics.test.js test/reef.test.js test/store.test.js test/api.test.js",
+    "test:all": "node --test test/domain.test.js test/physics.test.js test/reef.test.js test/store.test.js test/api.test.js && node test/e2e-browser.test.js",
+    "test:e2e": "node test/e2e-browser.test.js"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
   }
 }

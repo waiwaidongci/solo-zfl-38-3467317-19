@@ -43,5 +43,383 @@
         }
       ]
     }
-  ]
+  ],
+  "rigs": [
+    {
+      "code": "FC-001",
+      "name": "福船（1:48 复原模型）",
+      "displacement": 60000,
+      "sails": [
+        {
+          "id": "fore",
+          "name": "前桅帆",
+          "area": 42,
+          "centroid": {
+            "x": 8,
+            "y": 0,
+            "z": 9
+          },
+          "reefs": [
+            {
+              "level": 0,
+              "name": "满帆",
+              "areaFactor": 1
+            },
+            {
+              "level": 1,
+              "name": "收一档",
+              "areaFactor": 0.72,
+              "centroidShift": {
+                "x": 0,
+                "z": -0.8
+              }
+            },
+            {
+              "level": 2,
+              "name": "收二档",
+              "areaFactor": 0.42,
+              "centroidShift": {
+                "x": 0,
+                "z": -1.6
+              }
+            },
+            {
+              "level": 3,
+              "name": "收三档",
+              "areaFactor": 0.12,
+              "centroidShift": {
+                "x": 0,
+                "z": -2.4
+              }
+            }
+          ]
+        },
+        {
+          "id": "main",
+          "name": "主桅帆",
+          "area": 64,
+          "centroid": {
+            "x": 0,
+            "y": 0,
+            "z": 12
+          },
+          "reefs": [
+            {
+              "level": 0,
+              "name": "满帆",
+              "areaFactor": 1
+            },
+            {
+              "level": 1,
+              "name": "收一档",
+              "areaFactor": 0.7,
+              "centroidShift": {
+                "x": 0,
+                "z": -1.1
+              }
+            },
+            {
+              "level": 2,
+              "name": "收二档",
+              "areaFactor": 0.38,
+              "centroidShift": {
+                "x": 0,
+                "z": -2.2
+              }
+            },
+            {
+              "level": 3,
+              "name": "收三档",
+              "areaFactor": 0.1,
+              "centroidShift": {
+                "x": 0,
+                "z": -3.3
+              }
+            }
+          ]
+        },
+        {
+          "id": "mizzen",
+          "name": "尾桅帆",
+          "area": 28,
+          "centroid": {
+            "x": -9,
+            "y": 0,
+            "z": 8
+          },
+          "reefs": [
+            {
+              "level": 0,
+              "name": "满帆",
+              "areaFactor": 1
+            },
+            {
+              "level": 1,
+              "name": "收一档",
+              "areaFactor": 0.68,
+              "centroidShift": {
+                "x": 0,
+                "z": -0.7
+              }
+            },
+            {
+              "level": 2,
+              "name": "收二档",
+              "areaFactor": 0.35,
+              "centroidShift": {
+                "x": 0,
+                "z": -1.4
+              }
+            },
+            {
+              "level": 3,
+              "name": "收三档",
+              "areaFactor": 0.08,
+              "centroidShift": {
+                "x": 0,
+                "z": -2
+              }
+            }
+          ]
+        }
+      ],
+      "rightingCurve": [
+        {
+          "heel": 0,
+          "arm": 0
+        },
+        {
+          "heel": 10,
+          "arm": 0.42
+        },
+        {
+          "heel": 20,
+          "arm": 0.55
+        },
+        {
+          "heel": 30,
+          "arm": 0.48
+        },
+        {
+          "heel": 40,
+          "arm": 0.3
+        },
+        {
+          "heel": 60,
+          "arm": 0.05
+        },
+        {
+          "heel": 90,
+          "arm": 0
+        }
+      ],
+      "limits": {
+        "dangerHeel": 40,
+        "xRange": [
+          -6,
+          6
+        ],
+        "safetyFactor": 1.5
+      },
+      "version": 1,
+      "currentLevels": {
+        "fore": 0,
+        "main": 0,
+        "mizzen": 0
+      },
+      "createdAt": "2026-06-01T00:00:00.000Z",
+      "updatedAt": "2026-06-01T00:00:00.000Z",
+      "createdBy": "seed",
+      "logs": []
+    },
+    {
+      "code": "SD-002",
+      "name": "浅吃水沙船（复原力偏弱）",
+      "displacement": 55000,
+      "sails": [
+        {
+          "id": "fore",
+          "name": "前桅帆",
+          "area": 42,
+          "centroid": {
+            "x": 8,
+            "y": 0,
+            "z": 9
+          },
+          "reefs": [
+            {
+              "level": 0,
+              "name": "满帆",
+              "areaFactor": 1
+            },
+            {
+              "level": 1,
+              "name": "收一档",
+              "areaFactor": 0.72,
+              "centroidShift": {
+                "x": 0,
+                "z": -0.8
+              }
+            },
+            {
+              "level": 2,
+              "name": "收二档",
+              "areaFactor": 0.42,
+              "centroidShift": {
+                "x": 0,
+                "z": -1.6
+              }
+            },
+            {
+              "level": 3,
+              "name": "收三档",
+              "areaFactor": 0.12,
+              "centroidShift": {
+                "x": 0,
+                "z": -2.4
+              }
+            }
+          ]
+        },
+        {
+          "id": "main",
+          "name": "主桅帆",
+          "area": 64,
+          "centroid": {
+            "x": 0,
+            "y": 0,
+            "z": 12
+          },
+          "reefs": [
+            {
+              "level": 0,
+              "name": "满帆",
+              "areaFactor": 1
+            },
+            {
+              "level": 1,
+              "name": "收一档",
+              "areaFactor": 0.7,
+              "centroidShift": {
+                "x": 0,
+                "z": -1.1
+              }
+            },
+            {
+              "level": 2,
+              "name": "收二档",
+              "areaFactor": 0.38,
+              "centroidShift": {
+                "x": 0,
+                "z": -2.2
+              }
+            },
+            {
+              "level": 3,
+              "name": "收三档",
+              "areaFactor": 0.1,
+              "centroidShift": {
+                "x": 0,
+                "z": -3.3
+              }
+            }
+          ]
+        },
+        {
+          "id": "mizzen",
+          "name": "尾桅帆",
+          "area": 28,
+          "centroid": {
+            "x": -9,
+            "y": 0,
+            "z": 8
+          },
+          "reefs": [
+            {
+              "level": 0,
+              "name": "满帆",
+              "areaFactor": 1
+            },
+            {
+              "level": 1,
+              "name": "收一档",
+              "areaFactor": 0.68,
+              "centroidShift": {
+                "x": 0,
+                "z": -0.7
+              }
+            },
+            {
+              "level": 2,
+              "name": "收二档",
+              "areaFactor": 0.35,
+              "centroidShift": {
+                "x": 0,
+                "z": -1.4
+              }
+            },
+            {
+              "level": 3,
+              "name": "收三档",
+              "areaFactor": 0.08,
+              "centroidShift": {
+                "x": 0,
+                "z": -2
+              }
+            }
+          ]
+        }
+      ],
+      "rightingCurve": [
+        {
+          "heel": 0,
+          "arm": 0
+        },
+        {
+          "heel": 10,
+          "arm": 0.18
+        },
+        {
+          "heel": 20,
+          "arm": 0.14
+        },
+        {
+          "heel": 30,
+          "arm": 0.07
+        },
+        {
+          "heel": 40,
+          "arm": 0.03
+        },
+        {
+          "heel": 60,
+          "arm": 0
+        },
+        {
+          "heel": 90,
+          "arm": -0.05
+        }
+      ],
+      "limits": {
+        "dangerHeel": 40,
+        "xRange": [
+          -6,
+          6
+        ],
+        "safetyFactor": 1.5
+      },
+      "version": 1,
+      "currentLevels": {
+        "fore": 0,
+        "main": 0,
+        "mizzen": 0
+      },
+      "createdAt": "2026-06-01T00:00:00.000Z",
+      "updatedAt": "2026-06-01T00:00:00.000Z",
+      "createdBy": "seed",
+      "logs": []
+    }
+  ],
+  "fileVersion": 2,
+  "version": 1
 }
