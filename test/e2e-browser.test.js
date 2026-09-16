@@ -297,3 +297,70 @@ test("浏览器更新帆装定义：减档钳制迁移、reject 整体拒绝、�
   assert.equal(errors.length, 0, "页面 JS 错误：" + errors.join(" | "));
   await page.close();
 });
+
+test("浏览器旧台账：两条任务与模型日志可见，可追加且旧记录不变", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sail-legacy-"));
+  const file = path.join(dir, "db.json");
+  const srv = await startServer(file);
+  t.after(async () => { await srv.stop(); await rm(dir, { recursive: true, force: true }); });
+
+  const page = await browser.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.goto(srv.base);
+
+  // 展开旧版台账
+  await page.click("summary");
+  await page.waitForSelector("#mList");
+  const text = await page.textContent("#mList");
+  assert.match(text, /MR-001/);
+  assert.match(text, /T-1[\s\S]*?前桅侧支索[\s\S]*?已缩短2mm/);
+  assert.match(text, /T-1782013829186[\s\S]*?后桅升帆索[\s\S]*?回退半圈/);
+  assert.match(text, /模型日志（1 条）[\s\S]*?后桅升帆索 · 偏紧/);
+  await page.screenshot({ path: path.join(shotDir, "12-legacy-ledger.png"), fullPage: true });
+
+  // 通过页面输入框给 MR-001 追加一条模型日志（id 缺失时回退 code）
+  const before = await page.textContent("#mList");
+  await page.fill('.m-log-note[data-id="MR-001"]', "浏览器回归追加");
+  await page.click('.m-log-btn[data-id="MR-001"]');
+  await page.waitForFunction(
+    () => /模型日志（2 条）/.test(document.querySelector("#mList").textContent) &&
+          /浏览器回归追加/.test(document.querySelector("#mList").textContent)
+  );
+  const after = await page.textContent("#mList");
+  // 旧的两条帆索任务与原日志都还在
+  assert.match(after, /T-1[\s\S]*?前桅侧支索[\s\S]*?已缩短2mm/);
+  assert.match(after, /T-1782013829186[\s\S]*?后桅升帆索[\s\S]*?回退半圈/);
+  assert.match(after, /后桅升帆索 · 偏紧/);
+  assert.match(after, /浏览器回归追加/);
+
+  // 追加新模型也不影响 MR-001
+  await page.fill("#mCode", "MR-E2E");
+  await page.fill("#mType", "鸟船");
+  await page.fill("#mOwner", "浏览器");
+  await page.click("#mAdd");
+  await page.waitForFunction(() => /MR-E2E/.test(document.querySelector("#mList").textContent));
+  const withNew = await page.textContent("#mList");
+  assert.match(withNew, /MR-001/);
+  assert.match(withNew, /MR-E2E/);
+  assert.match(withNew, /前桅侧支索/);
+  await page.screenshot({ path: path.join(shotDir, "13-legacy-append.png"), fullPage: true });
+
+  // 接口核对：快照字段完全一致
+  const items = await page.evaluate(async (base) =>
+    (await fetch(base + "/api/items").then((r) => r.json())), srv.base);
+  const mr = items.find((i) => i.code === "MR-001");
+  assert.deepEqual(mr.tasks.map((x) => x.id), ["T-1", "T-1782013829186"]);
+  assert.deepEqual(mr.tasks[0].logs, [{ at: "2026-06-12", note: "已缩短2mm" }]);
+  assert.deepEqual(mr.tasks[1].logs, [{ at: "2026-06-21T03:50:29.186Z", note: "回退半圈" }]);
+  assert.equal(mr.logs.filter((l) => l.note === "后桅升帆索 · 偏紧").length, 1);
+  assert.equal(mr.logs.filter((l) => l.note === "浏览器回归追加").length, 1);
+
+  // 新帆装功能仍然正常：切到 FC-001 能出决策
+  await page.click('.rigline[data-code="FC-001"]');
+  await page.waitForSelector(".banner");
+  assert.ok(await page.locator("#envelope svg").count() === 1);
+
+  assert.equal(errors.length, 0, "页面 JS 错误：" + errors.join(" | "));
+  await page.close();
+});

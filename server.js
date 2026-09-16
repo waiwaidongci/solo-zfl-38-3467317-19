@@ -7,7 +7,9 @@ import { seedData } from "./src/seed.js";
 import { createApp } from "./src/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = process.env.DB_PATH || join(__dirname, "data", "model-rigging-calibration.json");
+// 交付数据（只读快照）在 data/delivery/；运行时可写数据库默认在 data/runtime.json，
+// 两者分离：帆装功能启动/更新/测试都不会改写交付快照。可用 DB_PATH 覆盖。
+const dbPath = process.env.DB_PATH || join(__dirname, "data", "runtime.json");
 const port = Number(process.env.PORT || 3038);
 
 const store = new JsonStore(dbPath, seedData);

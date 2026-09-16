@@ -441,8 +441,39 @@ function rigVersion(code) {
 function loadItems() {
   api("/api/items").then(function (items) {
     el("mList").innerHTML = items.map(function (it) {
-      return '<div style="border-bottom:1px dashed #ccc;padding:6px 0"><b>' + esc(it.code) + "</b> " + esc(it.shipType || "") + ' <span class="pill">' + esc(it.status || "") + "</span> <span class='meta'>" + esc(it.owner || "") + "</span></div>";
+      var ident = it.id || it.code;
+      var tasks = (it.tasks || []).map(function (t) {
+        var logs = (t.logs || []).map(function (l) {
+          return '<div class="meta">· ' + esc(l.at) + " " + esc(l.note) + "</div>";
+        }).join("");
+        return '<div style="border:1px solid #dfe6db;border-radius:6px;padding:7px 9px;margin:6px 0">' +
+          '<b>' + esc(t.id) + "</b> " + esc(t.position) + ' <span class="pill">' + esc(t.tension || "") + "</span> " +
+          '<span class="pill">' + esc(t.status || "") + "</span>" + logs + "</div>";
+      }).join("");
+      var modelLogs = (it.logs || []).map(function (l) {
+        return '<div class="meta">· ' + esc(l.at) + " [" + esc(l.step || "记录") + "] " + esc(l.note) + "</div>";
+      }).join("");
+      return '<div style="border:1px solid #cfd8ca;border-radius:8px;padding:10px;margin:10px 0">' +
+        '<div><b>' + esc(it.code) + "</b> " + esc(it.shipType || "") + ' <span class="pill">' + esc(it.status || "") +
+        '</span> <span class="meta">' + esc(it.owner || "") + " · " + esc(it.scale || "") + "</span></div>" +
+        '<div class="meta" style="margin:5px 0">帆索任务（' + (it.tasks || []).length + " 条）</div>" + (tasks || '<div class="meta">无</div>') +
+        '<div class="meta" style="margin:7px 0 2px">模型日志（' + (it.logs || []).length + " 条）</div>" + (modelLogs || '<div class="meta">无</div>') +
+        '<div style="display:flex;gap:6px;margin-top:8px">' +
+        '<input class="m-log-note" data-id="' + esc(ident) + '" placeholder="追加模型日志…" style="flex:1">' +
+        '<button class="blue m-log-btn" data-id="' + esc(ident) + '">追加</button></div></div>';
     }).join("") || '<div class="meta">暂无</div>';
+    Array.prototype.forEach.call(document.querySelectorAll(".m-log-btn"), function (btn) {
+      btn.onclick = function () {
+        var id = btn.getAttribute("data-id");
+        var inp = document.querySelector('.m-log-note[data-id="' + id + '"]');
+        var note = inp.value.trim();
+        if (!note) return;
+        api("/api/items/" + encodeURIComponent(id) + "/logs", {
+          method: "POST", body: JSON.stringify({ step: "页面记录", note: note }),
+        }).then(function () { toast("已追加日志"); loadItems(); })
+          .catch(function (e) { toast(e.message, true); });
+      };
+    });
   }).catch(function () {});
 }
 el("mAdd").onclick = function () {

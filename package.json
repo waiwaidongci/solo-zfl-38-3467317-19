@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/domain.test.js test/physics.test.js test/reef.test.js test/store.test.js test/api.test.js",
-    "test:all": "node --test test/domain.test.js test/physics.test.js test/reef.test.js test/store.test.js test/api.test.js && node test/e2e-browser.test.js",
+    "test": "node --test test/domain.test.js test/physics.test.js test/reef.test.js test/store.test.js test/api.test.js test/legacy-snapshot.test.js",
+    "check:legacy": "node scripts/check-legacy.mjs",
+    "test:all": "node --test test/domain.test.js test/physics.test.js test/reef.test.js test/store.test.js test/api.test.js test/legacy-snapshot.test.js && node scripts/check-legacy.mjs && node test/e2e-browser.test.js",
     "test:e2e": "node test/e2e-browser.test.js"
   },
   "dependencies": {

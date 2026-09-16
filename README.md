@@ -8,11 +8,18 @@
 
 ```bash
 npm start            # http://localhost:3038 （PORT 可覆盖）
-npm test             # 61 个单元/集成测试：接口、算法、并发、回滚、持久化、档位兼容迁移
+npm test             # 66 个单元/集成测试：接口、算法、并发、回滚、持久化、档位兼容、旧台账快照
+npm run check:legacy # 旧台账真实回归（真实服务+重启+快照字节核对，临时库，不碰运行态）
 npm run test:e2e     # Playwright 真实浏览器四条路径（安全/降档/无解/冲突）
 ```
 
-数据仍保存在 `data/model-rigging-calibration.json`（v1 旧文件首次启动自动迁移到 v2，旧台账不丢）。
+数据布局（交付数据与运行时可写数据分离）：
+
+- `data/delivery/legacy-snapshot.json` — **不可变交付快照**：原型交付时的旧版帆索校准台账（MR-001 的两条帆索任务与模型级日志）。帆装功能的启动、更新、测试都不会写入它，可用 `sha256sum` 核对。
+- `data/runtime.json`（默认，可用 `DB_PATH` 覆盖）— 运行时可写数据库：首次启动时从快照深拷贝播种旧台账，并叠加两艘演示船；删除后下次启动自动再生。
+- v1 单文件旧库若经 `DB_PATH` 指向，首次加载仍会自动迁移（旧台账不丢）。
+
+校验旧台账未被改写：`npm run check:legacy`（启动真实服务，逐字段比对编号/任务/日志，验证追加与写失败回滚后重启仍一致，且快照文件字节不变）。
 
 ## 模型
 
@@ -77,5 +84,6 @@ src/reef.js        最小缩帆枚举决策（原因、下一步、最大安全�
 src/store.js       单写者队列、版本 CAS、原子写、回滚、v1 迁移
 src/seed.js        两艘演示船（FC-001 福船 / SD-002 浅吃水沙船）与旧台账种子
 src/page.js        页面
-test/              46 个 node:test 用例 + Playwright E2E
+test/              66 个 node:test 用例 + Playwright E2E（3 个浏览器套件）
+scripts/check-legacy.mjs  旧台账快照真实回归
 ```

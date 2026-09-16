@@ -21,3 +21,7 @@ Thumbs.db
 .vscode/
 .idea/
 test-results/
+
+# 运行时可写数据库（从 data/delivery 快照派生，可随时删除再生）
+data/runtime.json
+data/runtime.json.tmp-*

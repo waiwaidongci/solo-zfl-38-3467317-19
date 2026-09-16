@@ -1,6 +1,25 @@
-// 种子数据：两艘演示船 + 原型原有的帆索校准模型。
+// 种子数据：两艘演示船 + 原型交付快照中的帆索校准台账。
 // FC-001 福船：满帆安全到 5 级，6 级横风需要降档，约 9 级以上即使深收帆也无解。
 // SD-002 浅吃水沙船：复原力弱，7 级横风即无解，用于演示危险路径。
+//
+// 旧台账来自不可变交付快照 data/delivery/legacy-snapshot.json；
+// 该文件永不被写入，每次种子都深拷贝，运行时库与测试库的任何变更都不会回灌快照。
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SNAPSHOT_PATH = join(__dirname, "..", "data", "delivery", "legacy-snapshot.json");
+
+let snapshotCache = null;
+export function legacySnapshot() {
+  if (!snapshotCache) {
+    snapshotCache = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8"));
+  }
+  return structuredClone(snapshotCache);
+}
+
 
 const fore = {
   id: "fore", name: "前桅帆", area: 42, centroid: { x: 8, y: 0, z: 9 },
@@ -71,22 +90,9 @@ export function seedData() {
         logs: [],
       },
     ],
-    items: [
-      {
-        id: "MR-seed-001",
-        code: "MR-001",
-        shipType: "福船",
-        scale: "1:48",
-        mastCount: 3,
-        riggingMaterial: "蜡线",
-        owner: "周宁",
-        dueDate: "2026-06-28",
-        status: "校准中",
-        tasks: [
-          { id: "T-1", position: "前桅侧支索", tension: "偏松", status: "调整中", logs: [{ at: "2026-06-12", note: "已缩短2mm" }] },
-        ],
-        logs: [],
-      },
-    ],
+    // 旧台账：从不可变交付快照深拷贝（保留原始编号、两条任务与模型级日志）
+    items: legacySnapshot().items,
   };
 }
+
+export { SNAPSHOT_PATH };
