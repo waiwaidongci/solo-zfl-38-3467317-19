@@ -26,9 +26,24 @@ function toLevels(r, tuple) {
 test("低风级：safe，无需缩帆", () => {
   const d = decide(rig, { beaufort: 2, direction: 90 }, {});
   assert.equal(d.status, "safe");
+  assert.equal(d.feasible, true);
   assert.equal(d.solution, null);
   assert.ok(d.current.maxSafeBeaufort >= 2);
   assert.match(d.nextStep, /保持现档位/);
+});
+
+test("feasible 与安全状态一致：safe/reef_required 为 true，infeasible 为 false", () => {
+  const weak = validateRig(validRigInput({
+    code: "F",
+    displacement: 6000,
+    rightingCurve: [{ heel: 0, arm: 0 }, { heel: 10, arm: 0.03 }, { heel: 20, arm: 0.02 },
+      { heel: 30, arm: 0.01 }, { heel: 40, arm: 0 }, { heel: 60, arm: -0.02 }, { heel: 90, arm: -0.05 }],
+  }));
+  assert.equal(decide(rig, { beaufort: 1, direction: 90 }, {}).feasible, true);
+  assert.equal(decide(rig, { beaufort: 7, direction: 90 }, {}).status, "reef_required");
+  assert.equal(decide(rig, { beaufort: 7, direction: 90 }, {}).feasible, true);
+  assert.equal(decide(weak, { beaufort: 12, direction: 90 }, {}).feasible, false);
+  assert.equal(decide(rig, { beaufort: 12, direction: 0 }, {}).feasible, true);
 });
 
 test("风级升高：reef_required，方案逐级可达且最小", () => {

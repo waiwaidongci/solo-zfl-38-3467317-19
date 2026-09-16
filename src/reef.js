@@ -121,7 +121,7 @@ export function decide(rig, wind, inputLevels = {}, opts = {}) {
   }
 
   // 结论、原因与下一步
-  let feasible = Boolean(solution);
+  let feasible;
   let status;
   let reason;
   let nextStep;
@@ -129,12 +129,14 @@ export function decide(rig, wind, inputLevels = {}, opts = {}) {
 
   if (curEval.safe) {
     status = "safe";
+    feasible = true;
     reason = `当前缩帆档位在 ${beaufort} 级风下满足复原力与纵向平衡要求`;
     nextStep = curMax.max !== null && curMax.max < 12
       ? `保持现档位；风力升至 ${curMax.max + 1} 级前先收一档，现档位最高可承受 ${curMax.max} 级`
       : "保持现档位，按正常更值守望";
   } else if (solution) {
     status = "reef_required";
+    feasible = true;
     for (const s of rig.sails) {
       const d = solution.levels[s.id] - current[s.id];
       if (d > 0) firstMoves.push({ sailId: s.id, name: s.name, from: current[s.id], to: current[s.id] + 1, depth: d });

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  ValidationError, validateRig, validateMoves, validateWind,
+  ValidationError, validateRig, validateMoves, validateWind, migrateLevels,
 } from "../src/domain.js";
 import { validRigInput } from "./helpers.js";
 
@@ -94,4 +94,82 @@ test("逐级调整：跳两档拒绝、单步放行、同帆重复拒绝", () =>
   // 合法单步（含放帆 2->1）
   assert.doesNotThrow(() => validateMoves(rig, { a: 2, b: 0 }, [{ sailId: "a", toLevel: 1 }]));
   assert.doesNotThrow(() => validateMoves(rig, { a: 0, b: 0 }, [{ sailId: "a", toLevel: 1 }, { sailId: "b", toLevel: 1 }]));
+});
+
+test("档位迁移 clamp：减少档数时越界档钳到末档", () => {
+  const oldRig = validateRig(validRigInput()); // a,b 各 3 档（0..2）
+  const fewer = validateRig(validRigInput({
+    sails: [
+      { id: "a", name: "前帆", area: 40, centroid: { x: 6, z: 9 }, reefs: [{ level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.6 }] },
+      { id: "b", name: "主帆", area: 60, centroid: { x: 0, z: 12 }, reefs: [
+        { level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.65, centroidShift: { z: -1 } }, { level: 2, areaFactor: 0.3, centroidShift: { z: -2 } },
+      ] },
+    ],
+  }));
+  const old = { ...oldRig, currentLevels: { a: 2, b: 1 } };
+  const { levels, migrations } = migrateLevels(old, fewer, "clamp");
+  assert.deepEqual(levels, { a: 1, b: 1 });
+  const m = migrations.find((x) => x.sailId === "a");
+  assert.equal(m.action, "clamped");
+  assert.equal(m.from, 2);
+  assert.equal(m.to, 1);
+  // 迁移后所有档位都在新定义内，可直接用于逐级作业
+  assert.doesNotThrow(() => validateMoves(fewer, levels, [{ sailId: "a", toLevel: 0 }]));
+});
+
+test("档位迁移 clamp：复用帆面编号按新档数钳制，不视为新帆", () => {
+  const oldRig = validateRig(validRigInput());
+  const reused = validateRig(validRigInput({
+    sails: [
+      { id: "a", name: "另一面前帆", area: 20, centroid: { x: 5, z: 8 }, reefs: [{ level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.5 }] },
+      { id: "b", name: "主帆", area: 60, centroid: { x: 0, z: 12 }, reefs: [
+        { level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.65, centroidShift: { z: -1 } }, { level: 2, areaFactor: 0.3, centroidShift: { z: -2 } },
+      ] },
+    ],
+  }));
+  const { levels, migrations } = migrateLevels({ ...oldRig, currentLevels: { a: 2, b: 0 } }, reused, "clamp");
+  assert.equal(levels.a, 1);
+  assert.equal(migrations.some((m) => m.sailId === "a" && m.action === "added"), false);
+  assert.ok(migrations.some((m) => m.sailId === "a" && m.action === "clamped"));
+});
+
+test("档位迁移 clamp：移除帆删档、新增帆初始 0 档", () => {
+  const oldRig = validateRig(validRigInput());
+  const onlyA = validateRig(validRigInput({
+    sails: [
+      oldRig.sails[0],
+      {
+        id: "c", name: "新帆", area: 15, centroid: { x: 3, z: 7 },
+        reefs: [{ level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.4 }],
+      },
+    ],
+  }));
+  const { levels, migrations } = migrateLevels(
+    { ...oldRig, currentLevels: { a: 1, b: 0 } }, onlyA, "clamp"
+  );
+  assert.deepEqual(levels, { a: 1, c: 0 });
+  assert.deepEqual(migrations.map((m) => m.sailId + ":" + m.action).sort(), ["b:removed", "c:added"]);
+});
+
+test("档位迁移 reject：越界档或移除收帆中的帆整体拒绝", () => {
+  const oldRig = validateRig(validRigInput());
+  const fewer = validateRig(validRigInput({
+    sails: [
+      { id: "a", name: "前帆", area: 40, centroid: { x: 6, z: 9 }, reefs: [{ level: 0, areaFactor: 1 }] },
+      oldRig.sails[1],
+    ],
+  }));
+  expectCodes(() => migrateLevels({ ...oldRig, currentLevels: { a: 2, b: 0 } }, fewer, "reject"), ["LEVEL_OUT_OF_RANGE"]);
+  const noA = validateRig(validRigInput({ sails: [oldRig.sails[1]] }));
+  expectCodes(() => migrateLevels({ ...oldRig, currentLevels: { a: 1, b: 0 } }, noA, "reject"), ["LEVEL_SAIL_REMOVED"]);
+});
+
+test("档位迁移：无冲突时两种策略都不产生迁移记录", () => {
+  const rig = validateRig(validRigInput());
+  for (const policy of ["clamp", "reject"]) {
+    const { levels, migrations } = migrateLevels({ ...rig, currentLevels: { a: 1, b: 0 } }, rig, policy);
+    assert.deepEqual(levels, { a: 1, b: 0 });
+    assert.deepEqual(migrations, []);
+  }
+  expectCodes(() => migrateLevels({}, rig, "bogus"), ["LEVEL_POLICY_INVALID"]);
 });

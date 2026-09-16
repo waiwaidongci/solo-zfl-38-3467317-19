@@ -3,8 +3,7 @@ import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import { JsonStore } from "../src/store.js";
 import { seedData } from "../src/seed.js";
-import { ConflictError } from "../src/domain.js";
-import { validateRig } from "../src/domain.js";
+import { validateRig, ConflictError, ValidationError } from "../src/domain.js";
 import { tempDbFile, cleanup, validRigInput } from "./helpers.js";
 
 async function freshStore(label) {
@@ -149,4 +148,102 @@ test("无临时文件残留", async () => {
   const fs = await import("node:fs/promises");
   const names = await fs.readdir(file.split("/").slice(0, -1).join("/"));
   assert.deepEqual(names.filter((n) => n.endsWith(".tmp-" + process.pid)), []);
+});
+
+// ---- 更新帆装定义时的档位兼容迁移 ----
+function reefs(n) {
+  const factors = [1, 0.65, 0.3];
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push(i === 0
+      ? { level: 0, areaFactor: 1 }
+      : { level: i, areaFactor: factors[i] ?? 0.2, centroidShift: { z: -i } });
+  }
+  return out;
+}
+function rigWithSails(sails, over = {}) {
+  return validateRig(validRigInput({ code: "M-1", sails, ...over }));
+}
+const SAIL_A3 = { id: "a", name: "前帆", area: 40, centroid: { x: 6, z: 9 }, reefs: reefs(3) };
+const SAIL_B3 = { id: "b", name: "主帆", area: 60, centroid: { x: 0, z: 12 }, reefs: reefs(3) };
+const SAIL_A2 = { ...SAIL_A3, reefs: reefs(2) };
+const SAIL_A1 = { ...SAIL_A3, reefs: reefs(1) };
+const SAIL_C2 = { id: "c", name: "新帆", area: 15, centroid: { x: 3, z: 7 }, reefs: reefs(2) };
+
+test("更新减档 clamp：末档越界钳到新末档，可继续逐级作业，迁移留痕", async () => {
+  const { store } = await freshStore("mig-clamp");
+  await store.createRig(rigWithSails([SAIL_A3, SAIL_B3]));
+  await store.applyMoves("M-1", [{ sailId: "a", toLevel: 1 }], 1);
+  await store.applyMoves("M-1", [{ sailId: "a", toLevel: 2 }], 2); // a 在 2 档（末档）
+  const { rig, migrations, version } = await store.replaceRig(
+    "M-1", rigWithSails([SAIL_A2, SAIL_B3]), 3, { levelPolicy: "clamp" }
+  );
+  assert.equal(version, 4);
+  assert.equal(rig.currentLevels.a, 1); // 2 钳到 1
+  assert.equal(rig.currentLevels.b, 0);
+  assert.equal(migrations[0].action, "clamped");
+  assert.ok(rig.levelMigrations.some((m) => m.sailId === "a" && m.from === 2 && m.to === 1));
+  // 迁移后可继续逐级放帆
+  const r = await store.applyMoves("M-1", [{ sailId: "a", toLevel: 0 }], 4);
+  assert.equal(r.rig.currentLevels.a, 0);
+});
+
+test("更新减档 reject：整体拒绝且不部分落盘（版本、定义、档位、文件都不变）", async () => {
+  const { store, file } = await freshStore("mig-reject");
+  await store.createRig(rigWithSails([SAIL_A3, SAIL_B3]));
+  await store.applyMoves("M-1", [{ sailId: "a", toLevel: 1 }], 1);
+  await assert.rejects(
+    () => store.replaceRig("M-1", rigWithSails([SAIL_A1, SAIL_B3]), 2, { levelPolicy: "reject" }),
+    (e) => e instanceof ValidationError && e.errors.some((x) => x.code === "LEVEL_OUT_OF_RANGE")
+  );
+  const rig = await store.getRig("M-1");
+  assert.equal(rig.version, 2);                 // 版本未抬升
+  assert.equal(rig.sails[0].reefs.length, 3);   // 定义未变
+  assert.equal(rig.currentLevels.a, 1);          // 档位未变
+  const onDisk = JSON.parse(await readFile(file, "utf8"));
+  const onRig = onDisk.rigs.find((r) => r.code === "M-1");
+  assert.equal(onRig.sails[0].reefs.length, 3);
+  assert.equal(onRig.currentLevels.a, 1);
+});
+
+test("更新删帆/增帆 clamp：删档记录、新帆 0 档；reject 拦截收帆中删帆", async () => {
+  const { store } = await freshStore("mig-sails");
+  await store.createRig(rigWithSails([SAIL_A3, SAIL_B3]));
+  await store.applyMoves("M-1", [{ sailId: "b", toLevel: 1 }], 1);
+  // 移除 b（在 1 档），新增 c：clamp 成功并记录 removed+added
+  const r1 = await store.replaceRig("M-1", rigWithSails([SAIL_A3, SAIL_C2]), 2, { levelPolicy: "clamp" });
+  assert.deepEqual(r1.rig.currentLevels, { a: 0, c: 0 });
+  assert.deepEqual(r1.migrations.map((m) => m.sailId + ":" + m.action).sort(), ["b:removed", "c:added"]);
+  // reject 策略移除收帆中的帆：拒绝
+  await store.applyMoves("M-1", [{ sailId: "c", toLevel: 1 }], 3);
+  await assert.rejects(
+    () => store.replaceRig("M-1", rigWithSails([SAIL_A3]), 4, { levelPolicy: "reject" }),
+    (e) => e instanceof ValidationError && e.errors.some((x) => x.code === "LEVEL_SAIL_REMOVED")
+  );
+  const rig = await store.getRig("M-1");
+  assert.equal(rig.version, 4); // 拒绝未抬版本
+});
+
+test("复用帆面编号：按新档数钳制，不另建档位键", async () => {
+  const { store } = await freshStore("mig-reuse");
+  await store.createRig(rigWithSails([SAIL_A3, SAIL_B3]));
+  await store.applyMoves("M-1", [{ sailId: "a", toLevel: 2 }], 1);
+  // a 编号复用但档数减到 0..1，且改名换形心
+  const reused = { id: "a", name: "复用编号的新帆", area: 25, centroid: { x: 4, z: 8 }, reefs: reefs(2) };
+  const r = await store.replaceRig("M-1", rigWithSails([reused, SAIL_B3]), 2, { levelPolicy: "clamp" });
+  assert.deepEqual(Object.keys(r.rig.currentLevels).sort(), ["a", "b"]);
+  assert.equal(r.rig.currentLevels.a, 1);
+  assert.equal(r.rig.sails[0].name, "复用编号的新帆");
+});
+
+test("兼容更新（无档位冲突）不产生迁移记录、版本正常递增", async () => {
+  const { store } = await freshStore("mig-clean");
+  await store.createRig(rigWithSails([SAIL_A3, SAIL_B3]));
+  const r = await store.replaceRig(
+    "M-1", rigWithSails([SAIL_A3, SAIL_B3], { name: "仅改名" }), 1, { levelPolicy: "clamp" }
+  );
+  assert.equal(r.migrations.length, 0);
+  assert.equal(r.rig.version, 2);
+  assert.deepEqual(r.rig.currentLevels, { a: 0, b: 0 });
+  assert.ok(!r.rig.logs?.some((l) => l.step === "档位兼容迁移"));
 });

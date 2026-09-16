@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import * as fssync from "node:fs";
 import { dirname, join } from "node:path";
 
-import { ConflictError, NotFoundError } from "./domain.js";
+import { ConflictError, NotFoundError, migrateLevels } from "./domain.js";
 
 const FILE_VERSION = 2;
 
@@ -152,7 +152,9 @@ export class JsonStore {
   }
 
   // 替换整套帆装配平。expectedVersion 必填；不符 -> ConflictError（不可覆盖）。
+  // 旧 currentLevels 必须与新档位定义兼容：按 policy（clamp/reject）迁移或整体拒绝。
   async replaceRig(code, rig, expectedVersion, meta = {}) {
+    const policy = meta.levelPolicy || "clamp";
     return this._enqueue((draft) => {
       const idx = draft.rigs.findIndex((r) => r.code === code);
       if (idx < 0) throw new NotFoundError("rig_not_found", `船只 ${code} 未登记`);
@@ -164,17 +166,34 @@ export class JsonStore {
         throw new ConflictError("VERSION_CONFLICT",
           `版本冲突：本地依据 v${expectedVersion}，当前已是 v${existing.version}，拒绝覆盖`, existing.version);
       }
+      // 在同一事务草稿内迁移旧档位；抛 ValidationError 则草稿整体丢弃，不落盘
+      const { levels, migrations } = migrateLevels(existing, rig, policy);
+      const now = new Date().toISOString();
       const rec = {
         ...rig,
         version: existing.version + 1,
-        currentLevels: existing.currentLevels,
+        currentLevels: levels,
         createdAt: existing.createdAt,
-        updatedAt: new Date().toISOString(),
+        updatedAt: now,
         createdBy: existing.createdBy,
         updatedBy: meta.by || "anonymous",
+        levelMigrations: [
+          ...(existing.levelMigrations || []),
+          ...migrations.map((m) => ({ at: now, ...m })),
+        ],
       };
       draft.rigs[idx] = rec;
-      return { rig: structuredClone(rec), version: rec.version };
+      if (migrations.length) {
+        rec.logs ||= [];
+        rec.logs.push({
+          at: now,
+          step: "档位兼容迁移",
+          note: migrations.map((m) => `${m.sailId}: ${m.reason}`).join("；"),
+          policy,
+          by: meta.by || "anonymous",
+        });
+      }
+      return { rig: structuredClone(rec), version: rec.version, migrations };
     });
   }
 

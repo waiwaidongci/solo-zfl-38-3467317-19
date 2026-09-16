@@ -184,3 +184,116 @@ test("浏览器四条路径：安全 / 降档 / 无解 / 冲突（含重启持�
 
   await pageA.close();
 });
+
+test("浏览器更新帆装定义：减档钳制迁移、reject 整体拒绝、增删帆留痕", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sail-rigupdate-"));
+  const file = path.join(dir, "db.json");
+  const srv = await startServer(file);
+  t.after(async () => { await srv.stop(); await rm(dir, { recursive: true, force: true }); });
+
+  const page = await browser.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.goto(srv.base);
+  await page.waitForSelector(".rigline");
+  await page.click('.rigline[data-code="FC-001"]');
+  await page.waitForFunction(() => /FC-001/.test(document.querySelector("#storeVer").textContent));
+
+  // 先在页面上把主桅帆连续收至 3 档（末档）
+  await page.selectOption("#beaufort", "9");
+  for (let i = 0; i < 3; i++) {
+    await page.click('.lvlbtn[data-op="in"][data-sail="main"]');
+    await page.waitForTimeout(60);
+  }
+  await page.waitForFunction(() => /3 \/ 3 档/.test(
+    document.querySelector('#reefControls .sailrow:has([data-sail="main"]) .lvl').textContent
+  ));
+  const v3 = await page.textContent("#storeVer");
+  assert.match(v3, /v4/);
+
+  // 在浏览器内通过 fetch 拿到当前定义、把主桅帆缩帆档减为 0/1 两档
+  const editRig = await page.evaluate(async (base) => {
+    const get = await fetch(base + "/api/rigs/FC-001").then((r) => r.json());
+    const rig = get.rig;
+    rig.sails = rig.sails.map((s) => s.id === "main"
+      ? { ...s, reefs: s.reefs.filter((r) => r.level <= 1) }
+      : s);
+    return rig;
+  }, srv.base);
+
+  // 填进登记 JSON 框，策略 clamp，点“按当前版本更新”
+  await page.fill("#regJson", JSON.stringify(editRig));
+  await page.selectOption("#levelPolicy", "clamp");
+  await page.click("#regUpdate");
+  await page.waitForFunction(() => /v5/.test(document.querySelector("#storeVer").textContent));
+  // 主桅帆档数变 2、当前档由 3 钳到 1
+  await page.waitForFunction(() => /1 \/ 1 档/.test(
+    document.querySelector('#reefControls .sailrow:has([data-sail="main"]) .lvl').textContent
+  ));
+  const levelText = await page.textContent("#reefControls");
+  assert.match(levelText, /主桅帆[\s\S]*?1 \/ 1 档/);
+  await page.waitForFunction(() => /FC-001 v5/.test(document.querySelector("#regTarget").selectedOptions[0].textContent));
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.screenshot({ path: path.join(shotDir, "10-rig-update-clamped.png") });
+
+  // 决策接口仍正常（不再锁死）；B7 需要继续收前/尾帆（reef_required 且 feasible=true）
+  const decOk = await page.evaluate(async (base) => {
+    const [r7, r9] = await Promise.all([
+      fetch(base + "/api/rigs/FC-001/decision?beaufort=7&direction=90").then((x) => x.json()),
+      fetch(base + "/api/rigs/FC-001/decision?beaufort=9&direction=90").then((x) => x.json()),
+    ]);
+    return { b7: { status: r7.decision.status, feasible: r7.decision.feasible },
+             b9: { status: r9.decision.status, feasible: r9.decision.feasible } };
+  }, srv.base);
+  assert.equal(decOk.b7.status, "reef_required");
+  assert.equal(decOk.b7.feasible, true);
+  assert.equal(decOk.b9.feasible, decOk.b9.status !== "infeasible");
+
+  // reject 策略：把主桅帆再减成只有 0 档（当前 1 档会越界），应整体 422
+  const editRig2 = await page.evaluate(async (base) => {
+    const get = await fetch(base + "/api/rigs/FC-001").then((r) => r.json());
+    const rig = get.rig;
+    rig.expectedVersion = rig.version;
+    rig.levelPolicy = "reject";
+    rig.sails = rig.sails.map((s) => s.id === "main"
+      ? { ...s, reefs: s.reefs.filter((r) => r.level === 0) }
+      : s);
+    const resp = await fetch(base + "/api/rigs/FC-001", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(rig),
+    });
+    return { status: resp.status, body: await resp.json() };
+  }, srv.base);
+  assert.equal(editRig2.status, 422);
+  assert.ok(editRig2.body.details.some((d) => d.code === "LEVEL_OUT_OF_RANGE"));
+  // 未部分落盘：刷新后版本仍 v5、主桅帆仍是两档定义、档位 1
+  await page.click("#reload");
+  await page.waitForTimeout(150);
+  await page.click('.rigline[data-code="FC-001"]');
+  await page.waitForFunction(() => /v5/.test(document.querySelector("#storeVer").textContent));
+  const afterText = await page.textContent("#reefControls");
+  assert.match(afterText, /主桅帆[\s\S]*?1 \/ 1 档/);
+
+  // 增/删帆：移除尾桅帆、新增一面副帆（clamp，页面表单）
+  const editRig3 = await page.evaluate(async (base) => {
+    const get = await fetch(base + "/api/rigs/FC-001").then((r) => r.json());
+    const rig = get.rig;
+    rig.sails = rig.sails.filter((s) => s.id !== "mizzen");
+    rig.sails.push({ id: "spinnaker", name: "副帆", area: 12, centroid: { x: 7, y: 0, z: 10 },
+      reefs: [{ level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.4 }] });
+    return rig;
+  }, srv.base);
+  await page.fill("#regJson", JSON.stringify(editRig3));
+  await page.selectOption("#levelPolicy", "clamp");
+  await page.click("#regUpdate");
+  await page.waitForFunction(() => /v6/.test(document.querySelector("#storeVer").textContent));
+  const finalText = await page.textContent("#reefControls");
+  assert.match(finalText, /前桅帆/);
+  assert.match(finalText, /主桅帆/);
+  assert.match(finalText, /副帆[\s\S]*?0 \/ 1 档/);
+  assert.ok(!/尾桅帆/.test(finalText), "尾桅帆定义应已移除");
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.screenshot({ path: path.join(shotDir, "11-rig-update-sails.png") });
+
+  assert.equal(errors.length, 0, "页面 JS 错误：" + errors.join(" | "));
+  await page.close();
+});

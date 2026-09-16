@@ -244,6 +244,66 @@ export function validateRig(input) {
   };
 }
 
+// 更新帆装定义时，把旧 currentLevels 迁移到新定义上。
+//   - clamp（默认，确定性且可追溯）：
+//       * 超出新档数范围的旧档 -> 钳到新的末档；
+//       * 新定义中新增的帆（复用新编号也算新帆）-> 0 档（满帆）；
+//       * 已从定义中移除的帆 -> 删除其档位记录；
+//       所有实际迁移都记录在 returned.migrations 中，供审计日志与响应。
+//   - reject：发现任何越界旧档或“仍在收帆状态的帆被移除”即抛 ValidationError，整体拒绝。
+// 身份按帆面编号（sailId）认定：编号被复用时视为同一面帆的定义变更，按新档数钳制。
+export function migrateLevels(oldRig, newRig, policy = "clamp") {
+  if (policy !== "clamp" && policy !== "reject") {
+    throw new ValidationError([{ code: "LEVEL_POLICY_INVALID", path: "levelPolicy", message: `未知档位迁移策略 ${policy}` }]);
+  }
+  const errors = [];
+  const oldLevels = (oldRig && oldRig.currentLevels) || {};
+  const oldIds = new Set(((oldRig && oldRig.sails) || []).map((s) => s.id));
+  const levels = {};
+  const migrations = [];
+  const newIds = new Set(newRig.sails.map((s) => s.id));
+  const maxOf = (id) => newRig.sails.find((s) => s.id === id).reefs.length - 1;
+
+  for (const [id, oldLevel] of Object.entries(oldLevels)) {
+    if (!newIds.has(id)) {
+      if (oldLevel > 0 && policy === "reject") {
+        err(errors, "LEVEL_SAIL_REMOVED", `currentLevels.${id}`,
+          `帆面 ${id} 已收至 ${oldLevel} 档，但新定义移除了该帆：拒绝更新（改用 clamp 可移除并记录）`);
+      } else {
+        // 无论是否在收帆状态，移除帆面都留下可追溯记录
+        migrations.push({ sailId: id, action: "removed", from: oldLevel, to: null, reason: "帆面已从登记中移除，删除其档位" });
+      }
+      continue;
+    }
+    const max = maxOf(id);
+    if (!Number.isInteger(oldLevel) || oldLevel < 0 || oldLevel > max) {
+      if (policy === "reject") {
+        err(errors, "LEVEL_OUT_OF_RANGE", `currentLevels.${id}`,
+          `帆面 ${id} 当前 ${oldLevel} 档超出新定义的 0..${max} 档：拒绝更新`);
+        continue;
+      }
+      const clamped = Math.max(0, Math.min(Number.isInteger(oldLevel) ? oldLevel : 0, max));
+      levels[id] = clamped;
+      migrations.push({
+        sailId: id, action: "clamped", from: oldLevel, to: clamped,
+        reason: `旧档位 ${oldLevel} 超出新定义 0..${max}，钳至末档 ${clamped}`,
+      });
+    } else {
+      levels[id] = oldLevel;
+    }
+  }
+  for (const s of newRig.sails) {
+    if (!(s.id in levels)) {
+      levels[s.id] = 0;
+      if (!oldIds.has(s.id)) {
+        migrations.push({ sailId: s.id, action: "added", from: null, to: 0, reason: "新增帆面，初始化为满帆 0 档" });
+      }
+    }
+  }
+  if (errors.length) throw new ValidationError(errors);
+  return { levels, migrations };
+}
+
 // 校验“逐级调整”的作业指令：每面帆一次只能变动一档。
 export function validateMoves(rig, currentLevels, moves) {
   const errors = [];

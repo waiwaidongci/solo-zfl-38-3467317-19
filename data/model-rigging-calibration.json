@@ -1,49 +1,7 @@
 {
-  "items": [
-    {
-      "code": "MR-001",
-      "shipType": "福船",
-      "scale": "1:48",
-      "mastCount": 3,
-      "riggingMaterial": "蜡线",
-      "owner": "周宁",
-      "dueDate": "2026-06-28",
-      "status": "校准中",
-      "tasks": [
-        {
-          "id": "T-1",
-          "position": "前桅侧支索",
-          "tension": "偏松",
-          "status": "调整中",
-          "logs": [
-            {
-              "at": "2026-06-12",
-              "note": "已缩短2mm"
-            }
-          ]
-        },
-        {
-          "id": "T-1782013829186",
-          "position": "后桅升帆索",
-          "tension": "偏紧",
-          "status": "待检查",
-          "logs": [
-            {
-              "at": "2026-06-21T03:50:29.186Z",
-              "note": "回退半圈"
-            }
-          ]
-        }
-      ],
-      "logs": [
-        {
-          "at": "2026-06-21T03:50:29.186Z",
-          "step": "帆索",
-          "note": "后桅升帆索 · 偏紧"
-        }
-      ]
-    }
-  ],
+  "fileVersion": 2,
+  "version": 1,
+  "updatedAt": "2026-09-16T12:51:35.157Z",
   "rigs": [
     {
       "code": "FC-001",
@@ -420,6 +378,32 @@
       "logs": []
     }
   ],
-  "fileVersion": 2,
-  "version": 1
+  "items": [
+    {
+      "id": "MR-seed-001",
+      "code": "MR-001",
+      "shipType": "福船",
+      "scale": "1:48",
+      "mastCount": 3,
+      "riggingMaterial": "蜡线",
+      "owner": "周宁",
+      "dueDate": "2026-06-28",
+      "status": "校准中",
+      "tasks": [
+        {
+          "id": "T-1",
+          "position": "前桅侧支索",
+          "tension": "偏松",
+          "status": "调整中",
+          "logs": [
+            {
+              "at": "2026-06-12",
+              "note": "已缩短2mm"
+            }
+          ]
+        }
+      ],
+      "logs": []
+    }
+  ]
 }

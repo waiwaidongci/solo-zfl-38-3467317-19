@@ -62,6 +62,11 @@ export function renderPage() {
       <select id="regTarget"></select>
       <label>登记数据 JSON（帆面、面积、形心、缩帆档、复原力曲线、限制）</label>
       <textarea id="regJson" spellcheck="false"></textarea>
+      <label>更新时旧档位与新档位定义不兼容的处理</label>
+      <select id="levelPolicy">
+        <option value="clamp" selected>clamp：越界档钳到新末档、新增帆置 0 档、移除帆删档（全部留痕）</option>
+        <option value="reject">reject：存在越界档或移除收帆中的帆，整体拒绝更新</option>
+      </select>
       <div style="display:flex;gap:8px;margin-top:8px">
         <button id="regSubmit">提交登记（新建）</button>
         <button class="blue" id="regUpdate">按当前版本更新</button>
@@ -405,11 +410,20 @@ function submitRig(isUpdate) {
   catch (e) { el("regErr").textContent = "JSON 解析失败：" + e.message; return; }
   var target = el("regTarget").value;
   var url = isUpdate ? "/api/rigs/" + encodeURIComponent(target || data.code) : "/api/rigs";
-  if (isUpdate) data.expectedVersion = rigVersion(target);
+  if (isUpdate) {
+    data.expectedVersion = rigVersion(target);
+    data.levelPolicy = el("levelPolicy").value;
+  }
   api(url, { method: isUpdate ? "PUT" : "POST", body: JSON.stringify(data) })
     .then(function (d) {
       el("regErr").textContent = "";
-      toast(isUpdate ? "已更新至 v" + d.rig.version : "已登记 " + d.rig.code + " v" + d.rig.version);
+      var msg = isUpdate ? "已更新至 v" + d.rig.version : "已登记 " + d.rig.code + " v" + d.rig.version;
+      if (isUpdate && d.migrations && d.migrations.length) {
+        msg += "；档位迁移：" + d.migrations.map(function (m) {
+          return m.sailId + " " + (m.from === null ? "∅" : m.from) + "→" + (m.to === null ? "删除" : m.to);
+        }).join("、");
+      }
+      toast(msg);
       return loadRigs(d.rig.code).then(function () { return selectRig(d.rig.code); });
     })
     .catch(function (e) {

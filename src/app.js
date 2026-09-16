@@ -68,8 +68,11 @@ export function createApp(store) {
         if (rig.code !== code) {
           throw new ValidationError([{ code: "RIG_CODE_MISMATCH", path: "code", message: "路径编号与请求体编号不一致" }]);
         }
-        const { rig: saved } = await store.replaceRig(code, rig, expectedVersion, { by: input.by });
-        return send(res, 200, { rig: saved });
+        const policy = input.levelPolicy === "reject" ? "reject" : input.levelPolicy === undefined ? "clamp" : input.levelPolicy;
+        const { rig: saved, migrations } = await store.replaceRig(
+          code, rig, expectedVersion, { by: input.by, levelPolicy: policy }
+        );
+        return send(res, 200, { rig: saved, migrations, levelPolicy: policy });
       }
 
       // 缩帆决策（只读）：?beaufort=6&direction=90

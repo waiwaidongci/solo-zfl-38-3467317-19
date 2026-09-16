@@ -105,8 +105,10 @@ test("过期版本更新登记 409；正确版本更新成功", async () => {
   assert.equal(ok.status, 200);
   assert.equal(ok.data.rig.version, 2);
   assert.equal(ok.data.rig.name, "改过名的福船");
-  // currentLevels 保留
-  assert.deepEqual(ok.data.rig.currentLevels, { fore: 0, main: 0, mizzen: 0 });
+  // 帆面定义整体替换：旧 fore/main/mizzen 移除（0 档，记录但不告警），新 a/b 初始化为 0 档
+  assert.deepEqual(ok.data.rig.currentLevels, { a: 0, b: 0 });
+  const actions = ok.data.migrations.map((m) => m.sailId + ":" + m.action).sort();
+  assert.deepEqual(actions, ["a:added", "b:added", "fore:removed", "main:removed", "mizzen:removed"]);
 });
 
 test("登记校验：缺数据、曲线乱序、重复档分别 422", async () => {
@@ -153,4 +155,135 @@ test("旧版台账接口仍可用", async () => {
   assert.equal(created.status, 201);
   const list = await api(s.base, "/api/items");
   assert.ok(list.data.some((i) => i.code === "MR-X"));
+});
+
+test("更新减档：clamp 钳制越界档位并留痕，reject 整体 422 不落盘", async () => {
+  const s = await server("update-levels");
+  after(s.stop);
+  const baseBody = validRigInput({ code: "UP-1" });
+  const created = await api(s.base, "/api/rigs", { method: "POST", body: baseBody });
+  assert.equal(created.status, 201);
+  // a 收至 2 档（末档）
+  let r = await api(s.base, "/api/rigs/UP-1/reef", { method: "POST", body: { moves: [{ sailId: "a", toLevel: 1 }], expectedVersion: 1 } });
+  assert.equal(r.status, 200);
+  r = await api(s.base, "/api/rigs/UP-1/reef", { method: "POST", body: { moves: [{ sailId: "a", toLevel: 2 }], expectedVersion: 2 } });
+  assert.equal(r.status, 200);
+
+  // clamp：新定义 a 只有 0/1 两档 -> 2 钳到 1
+  const fewer = validRigInput({
+    code: "UP-1",
+    sails: [
+      { id: "a", name: "前帆", area: 40, centroid: { x: 6, z: 9 }, reefs: [
+        { level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.6, centroidShift: { z: -1 } }] },
+      baseBody.sails[1],
+    ],
+  });
+  const clamped = await api(s.base, "/api/rigs/UP-1", {
+    method: "PUT", body: { ...fewer, expectedVersion: 3, levelPolicy: "clamp" },
+  });
+  assert.equal(clamped.status, 200);
+  assert.equal(clamped.data.rig.currentLevels.a, 1);
+  assert.ok(clamped.data.migrations.some((m) => m.action === "clamped" && m.from === 2 && m.to === 1));
+  // 更新后决策不再 422，且逐级放帆可用
+  const dec = await api(s.base, "/api/rigs/UP-1/decision?beaufort=1&direction=90");
+  assert.equal(dec.status, 200);
+  assert.equal(dec.data.decision.feasible, true);
+  const out = await api(s.base, "/api/rigs/UP-1/reef", {
+    method: "POST", body: { moves: [{ sailId: "a", toLevel: 0 }], expectedVersion: 4 },
+  });
+  assert.equal(out.status, 200);
+  assert.equal(out.data.rig.currentLevels.a, 0);
+
+  // reject：先把 a 收至 1 档，再 PUT 成 a 只有 0 档 -> 422 且不抬版本/不落盘
+  await api(s.base, "/api/rigs/UP-1/reef", { method: "POST", body: { moves: [{ sailId: "a", toLevel: 1 }], expectedVersion: 5 } });
+  const onlyZero = validRigInput({
+    code: "UP-1",
+    sails: [
+      { id: "a", name: "前帆", area: 40, centroid: { x: 6, z: 9 }, reefs: [{ level: 0, areaFactor: 1 }] },
+      baseBody.sails[1],
+    ],
+  });
+  const rejected = await api(s.base, "/api/rigs/UP-1", {
+    method: "PUT", body: { ...onlyZero, expectedVersion: 6, levelPolicy: "reject" },
+  });
+  assert.equal(rejected.status, 422);
+  assert.ok(rejected.data.details.some((d) => d.code === "LEVEL_OUT_OF_RANGE"));
+  const afterReject = await api(s.base, "/api/rigs/UP-1");
+  assert.equal(afterReject.data.rig.version, 6);           // 版本未变
+  assert.equal(afterReject.data.rig.sails[0].reefs.length, 2); // 定义未变（仍两档）
+  assert.equal(afterReject.data.rig.currentLevels.a, 1);    // 档位未变
+
+  // 未知策略同样 422
+  const badPolicy = await api(s.base, "/api/rigs/UP-1", {
+    method: "PUT", body: { ...fewer, expectedVersion: 6, levelPolicy: "nope" },
+  });
+  assert.equal(badPolicy.status, 422);
+});
+
+test("更新移除/新增/复用帆面编号：clamp 正确迁移档位", async () => {
+  const s = await server("update-sails");
+  after(s.stop);
+  const baseBody = validRigInput({ code: "UP-2" });
+  await api(s.base, "/api/rigs", { method: "POST", body: baseBody });
+  await api(s.base, "/api/rigs/UP-2/reef", { method: "POST", body: { moves: [{ sailId: "b", toLevel: 1 }], expectedVersion: 1 } });
+
+  // 移除 b（收帆中），新增 c：clamp
+  const changed = validRigInput({
+    code: "UP-2",
+    sails: [
+      baseBody.sails[0],
+      { id: "c", name: "新帆", area: 15, centroid: { x: 3, z: 7 }, reefs: [{ level: 0, areaFactor: 1 }, { level: 1, areaFactor: 0.4 }] },
+    ],
+  });
+  const r = await api(s.base, "/api/rigs/UP-2", { method: "PUT", body: { ...changed, expectedVersion: 2 } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.data.rig.currentLevels, { a: 0, c: 0 });
+  const actions = r.data.migrations.map((m) => m.sailId + ":" + m.action).sort();
+  assert.deepEqual(actions, ["b:removed", "c:added"]);
+
+  // 复用编号 c：从 2 档船减成 1 档定义并复用 c 编号 -> clamp，不是 added
+  const reused = validRigInput({
+    code: "UP-2",
+    sails: [
+      baseBody.sails[0],
+      { id: "c", name: "复用编号的新帆", area: 18, centroid: { x: 2, z: 6 }, reefs: [{ level: 0, areaFactor: 1 }] },
+    ],
+  });
+  // c 当前 0 档，无越界，只改名不产生 clamped/added
+  const r2 = await api(s.base, "/api/rigs/UP-2", { method: "PUT", body: { ...reused, expectedVersion: 3 } });
+  assert.equal(r2.status, 200);
+  assert.equal(r2.data.rig.currentLevels.c, 0);
+  assert.equal(r2.data.rig.sails[1].name, "复用编号的新帆");
+  assert.deepEqual(r2.data.migrations, []);
+});
+
+test("合法更新（仅改曲线/名称）保持当前档位，无迁移记录", async () => {
+  const s = await server("update-clean");
+  after(s.stop);
+  const body = validRigInput({ code: "UP-3" });
+  await api(s.base, "/api/rigs", { method: "POST", body });
+  await api(s.base, "/api/rigs/UP-3/reef", { method: "POST", body: { moves: [{ sailId: "a", toLevel: 1 }], expectedVersion: 1 } });
+  const edited = validRigInput({
+    code: "UP-3", name: "改名",
+    rightingCurve: [
+      { heel: 0, arm: 0 }, { heel: 10, arm: 0.4 }, { heel: 20, arm: 0.5 },
+      { heel: 30, arm: 0.42 }, { heel: 40, arm: 0.25 }, { heel: 60, arm: 0.04 }, { heel: 90, arm: 0 },
+    ],
+  });
+  const r = await api(s.base, "/api/rigs/UP-3", { method: "PUT", body: { ...edited, expectedVersion: 2 } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.data.rig.currentLevels, { a: 1, b: 0 });
+  assert.deepEqual(r.data.migrations, []);
+  assert.equal(r.data.rig.name, "改名");
+});
+
+test("决策 feasible 标志与安全状态一致", async () => {
+  const s = await server("feasible-flag");
+  after(s.stop);
+  const safe = await api(s.base, "/api/rigs/SD-002/decision?beaufort=1&direction=90");
+  assert.equal(safe.data.decision.status, "safe");
+  assert.equal(safe.data.decision.feasible, true);
+  const no = await api(s.base, "/api/rigs/SD-002/decision?beaufort=10&direction=90");
+  assert.equal(no.data.decision.status, "infeasible");
+  assert.equal(no.data.decision.feasible, false);
 });
