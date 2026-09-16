@@ -26,6 +26,17 @@ export class NotFoundError extends Error {
   }
 }
 
+// 已落盘的运行时库结构损坏（区别于请求输入的 ValidationError）：
+// 拒绝启动/拒绝写入，绝不允许被空数组、内存缓存或种子数据兜底。
+export class CorruptDataError extends Error {
+  constructor(message, problems = []) {
+    super(message);
+    this.name = "CorruptDataError";
+    this.code = "RUNTIME_CORRUPT";
+    this.problems = problems;
+  }
+}
+
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 
 function err(errors, code, path, message) {

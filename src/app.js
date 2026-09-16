@@ -1,6 +1,6 @@
 // HTTP 应用：帆装配平登记 + 分级缩帆决策，保留旧版帆索校准接口。
 import {
-  ConflictError, NotFoundError, ValidationError,
+  ConflictError, CorruptDataError, NotFoundError, ValidationError,
   validateMoves, validateRig, validateWind,
 } from "./domain.js";
 import { decide } from "./reef.js";
@@ -37,11 +37,22 @@ export function createApp(store) {
 
     try {
       if (req.method === "GET" && p === "/") {
+        // 页面本身可打开；数据损坏时前端通过 health/接口看到拒绝启动提示
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         return res.end(renderPage());
       }
 
-      if (req.method === "GET" && p === "/health") return send(res, 200, { ok: true });
+      if (req.method === "GET" && p === "/health") {
+        const h = await store.health();
+        if (!h.ok) {
+          return send(res, 503, {
+            ok: false, error: "RUNTIME_CORRUPT",
+            message: h.error.message,
+            problems: h.error.problems || [],
+          });
+        }
+        return send(res, 200, { ok: true });
+      }
 
       // ---- 帆装配平 -------------------------------------------------------
       if (req.method === "GET" && p === "/api/rigs") {
@@ -183,6 +194,13 @@ export function createApp(store) {
       }
       if (error instanceof NotFoundError) {
         return send(res, 404, { error: error.code, message: error.message });
+      }
+      if (error instanceof CorruptDataError) {
+        // 运行时库结构损坏：拒绝服务，不返回任何缓存/空数据
+        res.writeHead(503, { "Content-Type": "application/json; charset=utf-8", "Retry-After": "0" });
+        return res.end(JSON.stringify({
+          error: "RUNTIME_CORRUPT", message: error.message, problems: error.problems,
+        }, null, 2));
       }
       return send(res, 500, { error: "internal_error", message: error.message });
     }

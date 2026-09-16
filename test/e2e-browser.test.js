@@ -501,3 +501,34 @@ test("浏览器双实例共享库：同时迁移不重复、同版本并发写�
   await page1.evaluate(() => window.scrollTo(0, 0));
   await page1.screenshot({ path: path.join(shotDir, "15-cross-instance.png") });
 });
+
+test("浏览器拒绝启动：运行时库结构损坏时显示致命横幅，不显示空数据", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sail-corrupt-"));
+  const file = path.join(dir, "runtime.json");
+  // 先建一份合法库，再删掉 items 模拟“缺少台账数组”
+  await writeFile(file, JSON.stringify({
+    fileVersion: 2, version: 1, updatedAt: "2026-09-16T00:00:00Z",
+    rigs: seedData().rigs,
+  }), "utf8");
+  const store = new JsonStore(file, seedData, { legacyPath: null });
+  const server = http.createServer(createApp(store));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(async () => { await new Promise((res) => server.close(() => res())); await rm(dir, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  await page.goto(base);
+  await page.waitForSelector("#fatalBox", { state: "visible" });
+  const fatal = await page.textContent("#fatalBox");
+  assert.match(fatal, /拒绝启动/);
+  assert.match(fatal, /items 必须是数组/);
+  // 船只列表不显示空帆装，而是数据不可用
+  assert.match(await page.textContent("#rigList"), /数据不可用/);
+  // 台账也不显示空模型
+  await page.click("summary");
+  await page.waitForTimeout(100);
+  assert.doesNotMatch(await page.textContent("#mList"), /MR-001/);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.screenshot({ path: path.join(shotDir, "16-runtime-corrupt.png") });
+});

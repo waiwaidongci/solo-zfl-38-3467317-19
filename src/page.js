@@ -29,6 +29,7 @@ export function renderPage() {
   .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 9px; font-size:12px; }
   .banner { border-radius:9px; padding:13px 15px; color:#fff; margin-bottom:12px; }
   .banner.safe { background:var(--safe); } .banner.reef { background:var(--reef); } .banner.bad { background:var(--bad); }
+  .fatal-banner { border-radius:9px; padding:13px 15px; color:#fff; margin-bottom:12px; background:var(--bad); border:3px solid #7a1d16; }
   .banner h2 { color:#fff; margin-bottom:4px; }
   .meta { color:var(--muted); font-size:12px; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
@@ -77,6 +78,7 @@ export function renderPage() {
 
   <div class="stack">
     <div class="conflict" id="conflictBox"></div>
+    <div class="fatal-banner" id="fatalBox" style="display:none"></div>
     <section class="panel">
       <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:end">
         <div><label>风级（蒲福）</label><select id="beaufort"></select></div>
@@ -119,13 +121,27 @@ export function renderPage() {
 
 <script>
 "use strict";
-var state = { rigs: [], rig: null, detail: null, decision: null, wind: { beaufort: 6, direction: 90 } };
+var state = { rigs: [], rig: null, detail: null, decision: null, wind: { beaufort: 6, direction: 90 }, fatal: false };
+
+function showFatal(data) {
+  state.fatal = true;
+  var box = el("fatalBox");
+  var problems = (data && data.problems || []).map(function (x) { return "<div class='meta'>· " + esc(x) + "</div>"; }).join("");
+  box.innerHTML = "<b>服务已拒绝启动：运行时数据结构损坏</b><div class='meta'>原数据文件未被改动，请修复后重启；以下字段未通过完整性校验：</div>" + problems;
+  box.style.display = "block";
+  ["evalBtn", "applyFirst", "regSubmit", "regUpdate", "mAdd"].forEach(function (id) {
+    var n = el(id); if (n) n.disabled = true;
+  });
+  var list = el("rigList");
+  if (list) list.innerHTML = '<div class="meta">数据不可用（运行时库结构损坏）</div>';
+}
 
 function api(path, options) {
   var opt = options || {};
   if (opt.body) { opt.headers = { "Content-Type": "application/json" }; }
   return fetch(path, opt).then(function (res) {
     return res.json().then(function (data) {
+      if (res.status === 503 && data && data.error === "RUNTIME_CORRUPT") { showFatal(data); }
       if (!res.ok) { var e = new Error(data.error || "请求失败"); e.status = res.status; e.data = data; throw e; }
       return data;
     });
@@ -485,9 +501,18 @@ el("mAdd").onclick = function () {
 el("reload").onclick = function () { loadRigs(state.rig && state.rig.code).then(function () { if (state.rig) return selectRig(state.rig.code); }).then(loadItems); };
 
 initWind();
-loadRigs().then(function () {
-  if (state.rigs.length) return selectRig(state.rigs[0].code);
-}).then(loadItems);
+// 启动先做健康预检：运行时库结构损坏时展示致命横幅，不用空数据填充页面
+fetch("/health").then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+  .then(function (h) {
+    if (!h.ok) { showFatal(h.d); return; }
+    loadRigs().then(function () {
+      if (state.rigs.length) return selectRig(state.rigs[0].code);
+    }).then(loadItems);
+  })
+  .catch(function () {
+    // health 本身不可达时仍尝试加载，由各请求自行报错
+    loadRigs().then(function () { if (state.rigs.length) return selectRig(state.rigs[0].code); }).then(loadItems);
+  });
 </script>
 </body>
 </html>`;

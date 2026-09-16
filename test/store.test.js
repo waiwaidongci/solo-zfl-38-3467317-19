@@ -123,7 +123,7 @@ test("运行时文件缺少 rigs（非法结构）拒绝启动而不是悄悄重
   after(() => cleanup(dir));
   await writeFile(file, JSON.stringify({ items: [{ id: "OLD-1", code: "MR-OLD" }] }), "utf8");
   const store = new JsonStore(file, seedData);
-  await assert.rejects(() => store.listItems(), /运行时数据文件/);
+  await assert.rejects(() => store.listItems(), (e) => e.name === "CorruptDataError" && /rigs 必须是数组/.test(e.message));
 });
 
 test("旧版数据文件经 legacyPath 安全迁移：items 保留、rigs 补齐", async () => {
@@ -147,7 +147,7 @@ test("损坏文件拒绝启动而不是悄悄重建", async () => {
   after(() => cleanup(dir));
   await writeFile(file, "{ not json", "utf8");
   const store = new JsonStore(file, seedData);
-  await assert.rejects(() => store.read(), /损坏/);
+  await assert.rejects(() => store.read(), (e) => e.name === "CorruptDataError" && /拒绝启动/.test(e.message));
 });
 
 test("无临时文件残留", async () => {

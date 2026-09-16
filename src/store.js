@@ -15,7 +15,7 @@ import { existsSync } from "node:fs";
 import * as fssync from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-import { ConflictError, NotFoundError, migrateLevels } from "./domain.js";
+import { ConflictError, CorruptDataError, NotFoundError, ValidationError, migrateLevels, validateRig } from "./domain.js";
 import { FileLock, LockTimeoutError } from "./file-lock.js";
 
 export { LockTimeoutError } from "./file-lock.js";
@@ -79,24 +79,21 @@ export class JsonStore {
     }
   }
 
-  // 从磁盘读取最新状态（必须持锁时调用）
+  // 从磁盘读取最新状态并严格校验（提交前在锁内调用）
   async _readDiskState() {
     const raw = await fs.readFile(this.filePath, "utf8");
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      throw new Error(`运行时数据文件损坏，拒绝写入: ${e.message}`);
+      throw new CorruptDataError(`运行时库 JSON 无法解析，拒绝写入: ${e.message}`, ["json-parse"]);
     }
-    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.rigs)) {
-      throw new Error("运行时数据文件结构非法，拒绝写入");
-    }
-    if (!Array.isArray(parsed.items)) parsed.items = [];
-    if (typeof parsed.version !== "number") parsed.version = 1;
+    this._validateState(parsed); // 写前发现磁盘已损坏：拒绝，绝不覆盖
     return parsed;
   }
 
   async _ensureLoaded() {
+    if (this.poisoned) throw this.poisoned;
     if (this.state) return;
     if (this._loading) return this._loading;
     this._loading = this.lock.withLock(async () => {
@@ -105,27 +102,143 @@ export class JsonStore {
       await this._cleanStaleTmpLocked();
 
       // 持锁后重新复查（另一实例可能刚完成迁移/播种）：
-      //   1) 新运行时文件存在 -> 直接读取复用，绝不重复导入；
+      //   1) 新运行时文件存在 -> 严格校验后直接读取复用，绝不重复导入；
       //   2) 仅有旧文件       -> 安全迁移到运行时文件；
       //   3) 两处都没有       -> 从交付快照播种。
-      if (existsSync(this.filePath)) {
-        this.state = await this._loadRuntime();
-        return;
+      try {
+        if (existsSync(this.filePath)) {
+          this.state = await this._loadRuntime();
+          return;
+        }
+        if (this.legacyPath && existsSync(this.legacyPath)) {
+          this.state = await this._migrateLegacy();
+          return;
+        }
+        const seeded = {
+          fileVersion: FILE_VERSION,
+          version: 1,
+          updatedAt: new Date().toISOString(),
+          ...this.seedFactory(),
+        };
+        this._validateState(seeded); // 种子也必须满足完整结构
+        await this._atomicWrite(seeded);
+        this.state = seeded;
+      } catch (e) {
+        if (!(e instanceof CorruptDataError)) throw e; // 锁超时等瞬态错误不毒化
+        this._poison(e);
+        throw e;
       }
-      if (this.legacyPath && existsSync(this.legacyPath)) {
-        this.state = await this._migrateLegacy();
-        return;
-      }
-      const seeded = {
-        fileVersion: FILE_VERSION,
-        version: 1,
-        updatedAt: new Date().toISOString(),
-        ...this.seedFactory(),
-      };
-      await this._atomicWrite(seeded);
-      this.state = seeded;
     }).finally(() => { this._loading = null; });
     return this._loading;
+  }
+
+  // 结构损坏后毒化实例：之后任何读/写都失败，不用缓存或种子兜底
+  _poison(error) {
+    const e = error instanceof CorruptDataError
+      ? error
+      : new CorruptDataError(error.message || String(error), []);
+    this.poisoned = e;
+    this.state = null;
+    return e;
+  }
+
+  async health() {
+    if (this.poisoned) return { ok: false, error: this.poisoned };
+    try {
+      await this._ensureLoaded();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e };
+    }
+  }
+
+  // 严格校验已落盘的运行时库。任何字段缺失/类型非法都收集后抛 CorruptDataError；
+  // 调用方禁止用空数组、内存缓存或种子数据兜底。
+  _validateState(state) {
+    const p = [];
+    const isObj = (x) => x && typeof x === "object" && !Array.isArray(x);
+    if (!isObj(state)) { p.push("根节点不是对象"); throw new CorruptDataError("运行时库结构损坏：根节点不是对象", p); }
+    if (state.fileVersion !== FILE_VERSION) p.push(`fileVersion 必须为 ${FILE_VERSION}，实际 ${String(state.fileVersion)}`);
+    if (!Number.isInteger(state.version) || state.version < 1) p.push("version 必须是 ≥1 的整数");
+    if (typeof state.updatedAt !== "string" || !state.updatedAt) p.push("updatedAt 必须是非空字符串");
+    if (!Array.isArray(state.rigs)) {
+      p.push("rigs 必须是数组");
+    } else {
+      const codes = new Set();
+      state.rigs.forEach((r, i) => {
+        const ctx = `rigs[${i}]`;
+        if (!isObj(r)) { p.push(ctx + " 不是对象"); return; }
+        if (typeof r.code !== "string" || !r.code) { p.push(ctx + ".code 非法"); return; }
+        if (codes.has(r.code)) { p.push(ctx + " 船只编号重复: " + r.code); return; }
+        codes.add(r.code);
+        try {
+          // 复用帆装领域校验（面积/形心/档位/曲线/限制全部覆盖）
+          validateRig(r);
+        } catch (e) {
+          if (e instanceof ValidationError) p.push(...e.errors.map((x) => `${ctx}: ${x.code} ${x.message}`));
+          else p.push(ctx + ": " + e.message);
+        }
+        if (!Number.isInteger(r.version) || r.version < 1) p.push(ctx + ".version 必须是 ≥1 整数");
+        if (!Array.isArray(r.sails)) {
+          p.push(ctx + ".sails 必须是数组");
+        } else if (!isObj(r.currentLevels)) {
+          p.push(ctx + ".currentLevels 必须是对象");
+        } else {
+          const ids = new Set(r.sails.map((s) => s && s.id));
+          for (const [sid, lv] of Object.entries(r.currentLevels)) {
+            const sail = r.sails.find((s) => s && s.id === sid);
+            if (!ids.has(sid) || !sail || !Array.isArray(sail.reefs)) {
+              p.push(`${ctx}.currentLevels 含未登记帆面 ${sid}`);
+              continue;
+            }
+            const max = sail.reefs.length - 1;
+            if (!Number.isInteger(lv) || lv < 0 || lv > max) {
+              p.push(`${ctx}.currentLevels.${sid}=${String(lv)} 超出 0..${max}`);
+            }
+          }
+        }
+        if (r.logs !== undefined && !Array.isArray(r.logs)) p.push(ctx + ".logs 必须是数组");
+      });
+    }
+    if (!Array.isArray(state.items)) {
+      p.push("items 必须是数组（缺少台账数组时拒绝启动，不用空数组兜底）");
+    } else {
+      state.items.forEach((it, i) => {
+        const ctx = `items[${i}]`;
+        if (!isObj(it)) { p.push(ctx + " 不是对象"); return; }
+        if (typeof it.code !== "string" || !it.code) p.push(ctx + ".code 必须是非空字符串");
+        if (it.id !== undefined && typeof it.id !== "string") p.push(ctx + ".id 必须是字符串");
+        if (!Array.isArray(it.tasks)) {
+          p.push(ctx + ".tasks 必须是数组");
+        } else {
+          it.tasks.forEach((t, j) => {
+            const tctx = `${ctx}.tasks[${j}]`;
+            if (!isObj(t)) { p.push(tctx + " 不是对象"); return; }
+            if (typeof t.id !== "string" || !t.id) p.push(tctx + ".id 必须是非空字符串");
+            if (typeof t.position !== "string") p.push(tctx + ".position 必须是字符串");
+            if (!Array.isArray(t.logs)) {
+              p.push(tctx + ".logs 必须是数组");
+            } else {
+              t.logs.forEach((l, k) => {
+                if (!isObj(l) || typeof l.at !== "string" || typeof l.note !== "string") {
+                  p.push(`${tctx}.logs[${k}] 必须是 {at:string,note:string}`);
+                }
+              });
+            }
+          });
+        }
+        if (!Array.isArray(it.logs)) {
+          p.push(ctx + ".logs 必须是数组");
+        } else {
+          it.logs.forEach((l, k) => {
+            if (!isObj(l) || typeof l.at !== "string" || typeof l.note !== "string") {
+              p.push(`${ctx}.logs[${k}] 必须是 {at:string,note:string}`);
+            }
+          });
+        }
+      });
+    }
+    if (p.length) throw new CorruptDataError("运行时库结构损坏，拒绝启动：\n  - " + p.join("\n  - "), p);
   }
 
   async _loadRuntime() {
@@ -134,41 +247,40 @@ export class JsonStore {
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      throw new Error(`运行时数据文件损坏，拒绝启动: ${e.message}`);
+      throw new CorruptDataError(`运行时库 JSON 无法解析，拒绝启动: ${e.message}`, ["json-parse"]);
     }
-    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.rigs)) {
-      throw new Error("运行时数据文件结构非法，拒绝启动");
-    }
-    if (!Array.isArray(parsed.items)) parsed.items = [];
-    if (typeof parsed.version !== "number") parsed.version = 1;
+    // 严格校验：缺 items、字段非法、版本元数据损坏都直接拒绝，绝不静默补默认值
+    this._validateState(parsed);
     return parsed;
   }
 
   // 读取并迁移旧版文件。旧文件只读，永不修改；结果原子写入新运行时文件。
   // 任何一步失败都抛错：此时运行时文件尚未 rename 出来，旧文件保持原样，可重试。
+  // 迁移产物必须通过与正常启动相同的严格结构校验，否则拒绝迁移（不写任何文件）。
   async _migrateLegacy() {
     const raw = await fs.readFile(this.legacyPath, "utf8");
     let legacy;
     try {
       legacy = JSON.parse(raw);
     } catch (e) {
-      throw new Error(`旧数据文件损坏，无法迁移（原文件未改动，请修复后重试）: ${e.message}`);
+      throw new CorruptDataError(`旧数据文件 JSON 无法解析，无法迁移（原文件未改动，请修复后重试）: ${e.message}`, ["legacy-json"]);
     }
     if (!legacy || typeof legacy !== "object") {
-      throw new Error("旧数据文件不是有效对象，无法迁移（原文件未改动）");
+      throw new CorruptDataError("旧数据文件不是有效对象，无法迁移（原文件未改动）", ["legacy-root"]);
     }
     if (legacy.items !== undefined && !Array.isArray(legacy.items)) {
-      throw new Error("旧数据文件的 items 不是数组，无法迁移（原文件未改动）");
+      throw new CorruptDataError("旧数据文件的 items 不是数组，无法迁移（原文件未改动）", ["legacy-items"]);
     }
     if (legacy.rigs !== undefined && !Array.isArray(legacy.rigs)) {
-      throw new Error("旧数据文件的 rigs 不是数组，无法迁移（原文件未改动）");
+      throw new CorruptDataError("旧数据文件的 rigs 不是数组，无法迁移（原文件未改动）", ["legacy-rigs"]);
     }
 
-    // 保留旧台账：编号、任务、日志逐字保留；缺 id 的旧记录用 code 兜底
+    // 保留旧台账：编号、任务、日志逐字保留；缺 id 的旧记录用 code 兜底；
+    // 同时把可能缺失的任务级/模型级日志规范化（迁移产物必须结构完整）。
     const items = (legacy.items || []).map((it) => ({
       ...it,
       id: it.id || it.code,
-      tasks: Array.isArray(it.tasks) ? it.tasks : [],
+      tasks: (Array.isArray(it.tasks) ? it.tasks : []).map((t) => ({ ...t, logs: Array.isArray(t.logs) ? t.logs : [] })),
       logs: Array.isArray(it.logs) ? it.logs : [],
     }));
 
@@ -194,6 +306,8 @@ export class JsonStore {
         rigsImported: Array.isArray(legacy.rigs) ? legacy.rigs.length : 0,
       },
     };
+    // 写盘前严格校验迁移产物；不合法就拒绝迁移，绝不落盘半截/空台账状态
+    this._validateState(state);
     // 原子落盘：rename 成功才算迁移成功；失败则不留运行时文件
     await this._atomicWrite(state);
     return state;
@@ -207,19 +321,32 @@ export class JsonStore {
   _enqueue(mutator) {
     const run = this.chain.then(async () => {
       await this._ensureLoaded();
+      if (this.poisoned) throw this.poisoned;
       return this.lock.withLock(async () => {
-        // 持锁后读最新磁盘状态（其他实例可能已提交）
-        const fresh = await this._readDiskState();
+        // 持锁后读最新磁盘状态并严格校验（其他实例可能已提交，或文件被外部损坏）
+        let fresh;
+        try {
+          fresh = await this._readDiskState();
+        } catch (e) {
+          throw this._poison(e); // 写前发现损坏：拒绝写入，不覆盖、不兜底
+        }
         let result;
         try {
           result = await mutator(fresh);
         } catch (e) {
-          // 业务/版本错误：草稿丢弃，不写盘；刷新内存缓存到最新磁盘状态
-          this.state = await this._readDiskStateSafe();
+          // 业务/版本错误：草稿丢弃，不写盘；缓存仍以刚通过校验的磁盘状态为准
+          this.state = fresh;
           throw e;
         }
         fresh.version = bump(fresh.version);
         fresh.updatedAt = new Date().toISOString();
+        // 提交前再校验草稿：mutator 若破坏了结构（非法嵌套/缺字段），拒绝落盘
+        try {
+          this._validateState(fresh);
+        } catch (e) {
+          this.state = await this._readDiskStateSafe();
+          throw e;
+        }
         try {
           await this._atomicWrite(fresh);
         } catch (e) {
@@ -238,18 +365,21 @@ export class JsonStore {
     try { return await this._readDiskState(); } catch { return this.state; }
   }
 
-  // 只读：优先返回跨实例最新版本（无锁，利用原子 rename 不会读到半截 JSON）；
-  // 读不到时回退本实例已加载缓存。
+  // 只读：每次都以磁盘严格校验后的最新状态为准；磁盘损坏即拒绝，绝不用缓存/空数组兜底
   async read() {
     const run = this.chain.then(async () => {
+      if (this.poisoned) throw this.poisoned;
       await this._ensureLoaded();
+      if (this.poisoned) throw this.poisoned;
       if (existsSync(this.filePath)) {
-        try {
-          const disk = await this._loadRuntime();
-          if (!this.state || disk.version >= this.state.version) this.state = disk;
-        } catch { /* 磁盘暂时不可读时用缓存 */ }
+        const disk = await this._loadRuntime(); // 损坏会抛 CorruptDataError 并由下方毒化
+        if (!this.state || disk.version >= this.state.version) this.state = disk;
       }
       return structuredClone(this.state);
+    }).catch((e) => {
+      // 结构损坏才毒化；锁超时等瞬态错误原样抛，后续可重试
+      if (e instanceof CorruptDataError) this._poison(e);
+      throw e;
     });
     this.chain = run.then(() => {}, () => {});
     return run;
